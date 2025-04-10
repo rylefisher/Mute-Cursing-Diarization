@@ -1,0 +1,17 @@
+setuptools
+pyinstaller
+whisperx
+moviepy==1.0.3
+scipy
+pydub
+soundfile
+noisereduce
+wave
+pysrt
+faster-whisper
+# torch==2.0.1 
+# torchvision==0.15.2 
+# torchaudio==2.0.2
+numpy==1.26.4
+cryptography
+librosa

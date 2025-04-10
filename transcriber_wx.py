@@ -36,40 +36,71 @@ class WhisperXTranscriber:
 
         # Default configurations
         self._default_asr_options = {
-            "log_prob_threshold": -1.0,
-            "no_speech_threshold": 0.6,
+            # Lower = more words accepted
+            "log_prob_threshold": None,
+            # Lower = less likely silence
+            "no_speech_threshold": 0.01,
+            # Sampling temperatures
             "temperatures": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+            # Use prev text as prompt
             "condition_on_previous_text": True,
-            "compression_ratio_threshold": 2.4,
+            # Disable compression check
+            "compression_ratio_threshold": None,
+            # Enable word timestamps
             "word_timestamps": True,
+            # Output with timestamps
             "without_timestamps": False,
-            "beam_size": 5,
-            "best_of": 5,
-            "patience": 1.0,
+            # Num beams for search
+            "beam_size": 10,
+            # Candidates per segment
+            "best_of": 10,
+            # Disable patience factor
+            "patience": None,
+            # Neutral length penalty
             "length_penalty": 1.0,
+            # No repetition penalty
             "repetition_penalty": 1.0,
+            # Allow repeating n-grams
             "no_repeat_ngram_size": 0,
+            # Reset prompt condition
             "prompt_reset_on_temperature": 0.5,
+            # Optional initial prompt
             "initial_prompt": None,
+            # Optional token prefix
             "prefix": None,
-            "suppress_blank": True,
-            "suppress_tokens": [-1],
+            # Do not suppress blanks
+            "suppress_blank": False,
+            # Do not suppress tokens
+            "suppress_tokens": [],
+            # Max initial timestamp
             "max_initial_timestamp": 1.0,
+            # Chars prepended to words
             "prepend_punctuations": "\"'“¿([{-",
+            # Chars appended to words
             "append_punctuations": "\"'.。,，!！?？:：”)]}、",
+            # Do not suppress numbers
             "suppress_numerals": False,
+            # Unlimited new tokens
             "max_new_tokens": None,
+            # Timestamp clipping method
             "clip_timestamps": "0",
+            # Disable hallucination filter
             "hallucination_silence_threshold": None,
+            # Optional hotwords list
             "hotwords": None,
         }
         self._default_vad_options = {
-            "vad_threshold": 0.2,
-            "min_speech_duration_ms": 250,
+            "vad_threshold": 0.1,
+            # Min duration for speech (ms)
+            "min_speech_duration_ms": 50,
+            # Max duration for speech (s)
             "max_speech_duration_s": float("inf"),
-            "min_silence_duration_ms": 100,
+            # Merge segments gap (ms)
+            "min_silence_duration_ms": 700,
+            # VAD processing window size
             "window_size_samples": 1024,
-            "speech_pad_ms": 400,
+            # Padding around speech (ms)
+            "speech_pad_ms": 500,
         }
         self._default_transcribe_config = {
             "chunk_size": 30,

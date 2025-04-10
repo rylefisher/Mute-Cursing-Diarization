@@ -420,12 +420,9 @@ def cleanup():
 
 def handler():
     file_paths = select_files()
-    print("Starting processing...")
-    processed_data = process_files(file_paths)
-
-    for audio_path, video_data in processed_data:  # Iterating through data
+    for audio_path in file_paths:  # Iterating through data
         if audio_path:
-            main(audio_path, video_data)
+            main(audio_path)
 
 
 def signal_handler(sig, frame):
@@ -434,50 +431,25 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
-def main(audio_path, video_):
+def main(audio_path):
     global transcript_paths, temp_folder
     transcript_paths = []
     print("loading model")
     transcriber = AudioTranscriber(model_size=MODEL_SIZE, device="cuda")
     print("finished")
     log_ = JSONLog(audio_path)
-    enums = split_audio(audio_path, "output", sr="44100")
+    # enums = split_audio(audio_path, "output", sr="44100")
+    transcriber.transcribe_and_censor(audio_path)
+    
     temp_folder = None
-    if enums:
-        for counter, audio_path in enumerate(enums):
-            if not temp_folder and audio_path:
-                temp_folder = Path(audio_path).parent.__str__()
-            print("wav_file_path type:", type(audio_path))
-            print("wav_file_path content:", audio_path)
-            print(
-                f"\n\nProcessing {audio_path}...@@@@@@@@@@@@@@@@@@@\n\nindex {counter+1} of {len(enums)}\n\n@@@@@@@@@@@@@@@@@@@\n\n"
-            )
-            transcriber.transcribe_and_censor(audio_path)
-
-    else:
-        print(f"Processing {audio_path}...")
-        transcriber.transcribe_and_censor(audio_path)
-    try:
-        combine_txt_files(transcriber.text_paths)
-    except Exception as e:
-        print(str(e))
-
     comb_path = combine_wav_files(transcriber.clean_audio_paths)
     orig_video = ""
     new_video = ""
     processed_audio = ""
-    orig_video = video_["path"]
     processed_audio = comb_path
     synchronizer_path = orig_video.replace(".mp4", "_clean2.mp4")
     new_video = orig_video.replace(".mp4", "_clean.mp4")
 
-    if video_["status"]:
-        add_audio_to_video(orig_video, processed_audio, new_video)
-        synchronizer = syncio.VideoAudioSynchronizer(
-            orig_video, processed_audio, synchronizer_path
-        )
-        synchronizer.ensure_no_leading_trailing_silence(comb_path)
-        synchronizer.synchronize_audio()
     files_ = ""
     try:
         for root, dirs, files in os.walk(temp_folder):
