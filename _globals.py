@@ -3,7 +3,7 @@ from pathlib import Path
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 MODEL_SIZE = r"turbo"
-SPLIT_IN_MS = 28
+SPLIT_IN_MS = 1100
 print("loading model")
 with open("hf_token.txt", "r") as f:
     tmp = f.read()
@@ -11,7 +11,7 @@ HF_TOKEN = tmp.strip()
 min_silence_duration = 0.08
 segment_duration = 3000
 tier1_buffer = 1.02
-tier2_buffer = 0.95
+tier2_buffer = 1.003
 CURSE_TIER1 = "curse_words_tier1.csv"
 CURSE_TIER2 = "curse_words_tier2.csv"
 CURSE_EXACT_MATCH = "curse_words_exact_match.csv"

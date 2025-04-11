@@ -222,7 +222,7 @@ def combine_wav_files(segment_paths):
         return
 
     output_nam = Path(segment_paths[0]).name
-    output_path = Path(segment_paths[0]).parent.parent / f"{output_nam}combined.wav"
+    output_path = Path(segment_paths[0]).parent / f"{output_nam}_final.wav"
     print(f"\n\ncombining!\n\n{segment_paths}\n\n")
     with wave.open(str(output_path), "w") as outfile:
         # Initialize parameters

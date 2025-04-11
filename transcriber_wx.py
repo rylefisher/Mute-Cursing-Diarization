@@ -8,16 +8,15 @@ from _globals import *
 
 class WhisperXTranscriber:
     """Handles transcription, alignment, and diarization."""
-
     def __init__(
         self,
         whisper_model_name: str = "large-v3-turbo",
         language_code: str = "en",
         device: str | None = None,
         compute_type: str = "float16",
-        batch_size: int = 16,
+        batch_size: int = 8,
         hf_token: str | None = None,  # HF token for diarization
-        diarize: bool = False,  # Flag to enable diarization
+        diarize: bool = True,  # Flag to enable diarization
         asr_options: dict | None = None,
         vad_options: dict | None = None,
         transcribe_config: dict | None = None,
@@ -34,12 +33,11 @@ class WhisperXTranscriber:
         self.hf_token = hf_token  # Store HF token
         self.diarize = diarize  # Store diarization flag
 
-        # Default configurations
         self._default_asr_options = {
             # Lower = more words accepted
-            "log_prob_threshold": None,
+            "log_prob_threshold": -2,
             # Lower = less likely silence
-            "no_speech_threshold": 0.01,
+            "no_speech_threshold": 0.15,
             # Sampling temperatures
             "temperatures": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
             # Use prev text as prompt
@@ -51,9 +49,9 @@ class WhisperXTranscriber:
             # Output with timestamps
             "without_timestamps": False,
             # Num beams for search
-            "beam_size": 10,
+            "beam_size": 6,
             # Candidates per segment
-            "best_of": 10,
+            "best_of": 6,
             # Disable patience factor
             "patience": None,
             # Neutral length penalty
@@ -69,15 +67,15 @@ class WhisperXTranscriber:
             # Optional token prefix
             "prefix": None,
             # Do not suppress blanks
-            "suppress_blank": False,
+            "suppress_blank": True,
             # Do not suppress tokens
             "suppress_tokens": [],
             # Max initial timestamp
             "max_initial_timestamp": 1.0,
             # Chars prepended to words
-            "prepend_punctuations": "\"'“¿([{-",
+            "prepend_punctuations": "",
             # Chars appended to words
-            "append_punctuations": "\"'.。,，!！?？:：”)]}、",
+            "append_punctuations": "",
             # Do not suppress numbers
             "suppress_numerals": False,
             # Unlimited new tokens
@@ -96,23 +94,23 @@ class WhisperXTranscriber:
             # Max duration for speech (s)
             "max_speech_duration_s": float("inf"),
             # Merge segments gap (ms)
-            "min_silence_duration_ms": 700,
+            "min_silence_duration_ms": 500,
             # VAD processing window size
             "window_size_samples": 1024,
             # Padding around speech (ms)
             "speech_pad_ms": 500,
         }
         self._default_transcribe_config = {
-            "chunk_size": 30,
-            "print_progress": False,
+            "chunk_size": 25,
+            "print_progress": True,
         }
         self._default_align_config = {
             "return_char_alignments": False,
-            "print_progress": False,
+            "print_progress": True,
         }
         self._default_diarize_options = {
             "min_speakers": None,
-            "max_speakers": None,
+            "max_speakers": 4,
         }
 
         # Merge user options with defaults
@@ -280,6 +278,7 @@ class WhisperXTranscriber:
     def process_audio(self, audio_path: str) -> dict:
         """Perform full transcription, alignment, and optional diarization."""
         # 1. Transcription
+        final_result = None
         transcription_result = self.transcribe(audio_path)
         if (
             "segments" not in transcription_result
@@ -296,8 +295,13 @@ class WhisperXTranscriber:
             return aligned_result  # Return aligned result even if empty for consistency
 
         # 3. Diarization (if enabled)
-        final_result = self.diarize_audio(audio_path, aligned_result)
-
+        # 3. Diarization (if enabled)
+        # 3. Diarization (if enabled)
+        # 3. Diarization (if enabled)
+        # 3. Diarization (if enabled)
+        # final_result = self.diarize_audio(audio_path, aligned_result)
+        if not final_result:
+            return aligned_result
         return final_result
 
     def print_aligned_segments(self, final_result: dict):

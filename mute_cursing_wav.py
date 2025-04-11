@@ -52,7 +52,7 @@ def split_audio(audio_file, output_dir, segment_duration=SPLIT_IN_MS, sr="44100"
         "-hwaccel",
         "auto",  # Enable hardware acceleration
         "-i",
-        str(audio_path),
+        str(audio_file),
         "-f",
         "segment",
         "-y",
@@ -324,12 +324,12 @@ class AudioTranscriber:
         aud, any_cursing_found = self.censor_cursing(
             audio_path, result
         )
-        if any_cursing_found:
-            print("\n\n")
-            print("@@@@@@@@@@@\nsecond go 'round\n@@@@@@@@@@@")
-            print("\n\n")
-            result = self.transcribe_audio(aud)
-            aud, _ = self.censor_cursing(aud, result)
+        # if any_cursing_found:
+        #     print("\n\n")
+        #     print("@@@@@@@@@@@\nsecond go 'round\n@@@@@@@@@@@")
+        #     print("\n\n")
+        #     result = self.transcribe_audio(aud)
+        #     aud, _ = self.censor_cursing(aud, result)
         self.clean_audio_paths.append(aud)
         self.clean_json_paths.append(self.clean_json)
 
@@ -439,16 +439,12 @@ def main(audio_path):
     print("finished")
     log_ = JSONLog(audio_path)
     # enums = split_audio(audio_path, "output", sr="44100")
-    transcriber.transcribe_and_censor(audio_path)
-    
+    # enums = split_audio(audio_path, "output", sr='44100')
     temp_folder = None
+    transcriber.transcribe_and_censor(audio_path)
+
     comb_path = combine_wav_files(transcriber.clean_audio_paths)
     orig_video = ""
-    new_video = ""
-    processed_audio = ""
-    processed_audio = comb_path
-    synchronizer_path = orig_video.replace(".mp4", "_clean2.mp4")
-    new_video = orig_video.replace(".mp4", "_clean.mp4")
 
     files_ = ""
     try:
