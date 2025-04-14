@@ -12,7 +12,7 @@ class WhisperXTranscriber:
         self,
         whisper_model_name: str = "large-v3-turbo",
         language_code: str = "en",
-        device: str | None = None,
+        device = "cuda",
         compute_type: str = "float16",
         batch_size: int = 8,
         hf_token: str | None = None,  # HF token for diarization
@@ -34,83 +34,52 @@ class WhisperXTranscriber:
         self.diarize = diarize  # Store diarization flag
 
         self._default_asr_options = {
-            # Lower = more words accepted
-            "log_prob_threshold": -2,
-            # Lower = less likely silence
-            "no_speech_threshold": 0.15,
-            # Sampling temperatures
-            "temperatures": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
-            # Use prev text as prompt
-            "condition_on_previous_text": True,
-            # Disable compression check
-            "compression_ratio_threshold": None,
-            # Enable word timestamps
-            "word_timestamps": True,
-            # Output with timestamps
+            "log_prob_threshold": -3.0, # Accept low confidence words
+            "no_speech_threshold": 0.1, # Catch quieter speech
+            "temperatures": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0], # Robustness
+            "condition_on_previous_text": True, # Context for long audio
+            "compression_ratio_threshold": None, # Disable filter
+            "word_timestamps": True, # Needed for alignment
             "without_timestamps": False,
-            # Num beams for search
-            "beam_size": 6,
-            # Candidates per segment
-            "best_of": 6,
-            # Disable patience factor
-            "patience": None,
-            # Neutral length penalty
+            "beam_size": 5, # Balance accuracy/speed
+            "best_of": 5, # Balance accuracy/speed
+            "patience": None, # Faster decoding
             "length_penalty": 1.0,
-            # No repetition penalty
             "repetition_penalty": 1.0,
-            # Allow repeating n-grams
             "no_repeat_ngram_size": 0,
-            # Reset prompt condition
             "prompt_reset_on_temperature": 0.5,
-            # Optional initial prompt
             "initial_prompt": None,
-            # Optional token prefix
             "prefix": None,
-            # Do not suppress blanks
             "suppress_blank": True,
-            # Do not suppress tokens
-            "suppress_tokens": [],
-            # Max initial timestamp
+            "suppress_tokens": [], # Ensure no tokens suppressed
             "max_initial_timestamp": 1.0,
-            # Chars prepended to words
             "prepend_punctuations": "",
-            # Chars appended to words
             "append_punctuations": "",
-            # Do not suppress numbers
             "suppress_numerals": False,
-            # Unlimited new tokens
             "max_new_tokens": None,
-            # Timestamp clipping method
             "clip_timestamps": "0",
-            # Disable hallucination filter
             "hallucination_silence_threshold": None,
-            # Optional hotwords list
-            "hotwords": None,
+            "hotwords": None, # Could add curses if needed
         }
         self._default_vad_options = {
-            "vad_threshold": 0.1,
-            # Min duration for speech (ms)
-            "min_speech_duration_ms": 50,
-            # Max duration for speech (s)
+            "vad_threshold": 0.15, # VAD sensitivity
+            "min_speech_duration_ms": 50, # Catch short speech
             "max_speech_duration_s": float("inf"),
-            # Merge segments gap (ms)
-            "min_silence_duration_ms": 500,
-            # VAD processing window size
+            "min_silence_duration_ms": 300, # Silence duration sensitivity
             "window_size_samples": 1024,
-            # Padding around speech (ms)
-            "speech_pad_ms": 500,
+            "speech_pad_ms": 500, # Padding around speech
         }
         self._default_transcribe_config = {
             "chunk_size": 25,
             "print_progress": True,
         }
         self._default_align_config = {
-            "return_char_alignments": False,
-            "print_progress": True,
+            "return_char_alignments": False,  # Not needed for words
+            "print_progress": True,  # Less console noise
         }
         self._default_diarize_options = {
-            "min_speakers": None,
-            "max_speakers": 4,
+            "min_speakers": None,  # Auto-detect
+            "max_speakers": None,  # Auto-detect or set upper limit
         }
 
         # Merge user options with defaults

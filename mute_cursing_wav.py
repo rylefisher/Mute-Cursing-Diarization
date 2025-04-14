@@ -24,6 +24,29 @@ def clean_path(path_str):
     clean_name = re.sub(r"_+", "_", clean_name)
     return path.with_stem(clean_name)
 
+# Function definition
+def shorten_and_copy_file(file_path: str) -> str:
+    # Get name, ext
+    base_name: str = os.path.basename(file_path)
+    name_part: str
+    ext_part: str
+    name_part, ext_part = os.path.splitext(base_name)
+    # Get time hhmm
+    time_str: str = datetime.now().strftime("%H%M")
+    # Truncate name
+    name_prefix: str = name_part[:4] # Max 4 chars
+    # Combine parts
+    new_filename: str = f"{name_prefix}{time_str}{ext_part}"
+    # Get dir path
+    dir_path: str = os.path.dirname(file_path)
+    new_file_path: str = os.path.join(dir_path, new_filename)
+    # Copy file
+    try:
+        shutil.copy2(file_path, new_file_path) # copy2 preserves meta
+    except Exception as e:
+        print(f"Error copying: {e}") # Basic error handle
+        return file_path  # Return empty on fail
+    return new_file_path
 
 def copy_file_with_time_stamp(file_path):
     directory = os.path.dirname(file_path)
@@ -228,21 +251,16 @@ def add_audio_to_video(video_file, audio_file, output_video):
 class AudioTranscriber:
     def __init__(self, model_size="large-v3", device="cuda"):
         global MODEL
-        try:
-            self.model = MODEL
-        except Exception as e:
-            print(
-                f"Error loading model: {e} Dont panic, I got this. You should really use nvidia for good results."
-            )
-            self.transcriber = WhisperXTranscriber(
-            diarize=True,  # Enable diarization
-            hf_token=HF_TOKEN,  # Pass the token
-            diarize_options={  # Optional: provide speaker hints
-                # "min_speakers": 2,
-                # "max_speakers": 2,
-            },
-            transcribe_config={"print_progress": True},
-            align_config={"print_progress": True},
+
+        self.transcriber = WhisperXTranscriber(
+        diarize=True,  # Enable diarization
+        hf_token=HF_TOKEN,  # Pass the token
+        diarize_options={  # Optional: provide speaker hints
+            # "min_speakers": 2,
+            # "max_speakers": 2,
+        },
+        transcribe_config={"print_progress": True},
+        align_config={"print_progress": True},
         )
         self.audio_paths = []
         self.index = len(self.audio_paths) - 1
@@ -313,26 +331,42 @@ class AudioTranscriber:
         with open(json_path, 'w') as f:
             json.dump(result, f)
 
-    def censor_cursing(self, audio_path, result):
-        return censor_cursewords(audio_path, result)
-
     def transcribe_and_censor(self, audio_path):
         """Process an audio file, transcribe it and save the results."""
         result = self.transcribe_audio(audio_path)
         resultSmall = result
         self.save_transcription(audio_path, result)
-        aud, any_cursing_found = self.censor_cursing(
-            audio_path, result
+        # Create the censorer instance
+        censorer = AudioCensorer(
+            censor_mode=CENSOR_MODE,
         )
-        # if any_cursing_found:
-        #     print("\n\n")
-        #     print("@@@@@@@@@@@\nsecond go 'round\n@@@@@@@@@@@")
-        #     print("\n\n")
-        #     result = self.transcribe_audio(aud)
-        #     aud, _ = self.censor_cursing(aud, result)
+        outdir = str(Path(audio_path).parent)
+        aud, was_censored = censorer.censor_audio_file(
+            audio_path, result, output_dir=outdir, log=True
+        )
+        temp_file = shorten_and_copy_file(aud)
+        if was_censored:
+            print('\n\nsecond go round\n\n')
+            result = self.transcribe_audio(temp_file)
+            self.save_transcription(temp_file, result)
+            censorer = AudioCensorer(
+                censor_mode=CENSOR_MODE,
+            )
+            aud2, was_censored = censorer.censor_audio_file(
+                temp_file, result, output_dir=outdir, log=True
+            )
+            self.clean_audio_paths.append(aud2)
+            self.clean_json_paths.append(self.clean_json)
+            print(f"\nSuccess! Censored file saved to: {aud2}")
+            return
+        else:
+            print('\n\nno cursing found\n\nexiting....')
+            exit()
+        if aud:
+            print(f"\nSuccess! Censored file saved to: {aud}")
         self.clean_audio_paths.append(aud)
         self.clean_json_paths.append(self.clean_json)
-
+        return
 
 def select_files():
     """This function uses tkinter to provide a GUI for selecting multiple audio or video files."""
@@ -443,7 +477,7 @@ def main(audio_path):
     temp_folder = None
     transcriber.transcribe_and_censor(audio_path)
 
-    comb_path = combine_wav_files(transcriber.clean_audio_paths)
+    # comb_path = combine_wav_files(transcriber.clean_audio_paths)
     orig_video = ""
 
     files_ = ""
@@ -467,7 +501,6 @@ def main(audio_path):
         except Exception as e:
             print(f"Error deleting temp folder: {e}")
     print("\nits\ndone\nnow\n")
-
 
 if __name__ == "__main__":
     # Register signal handlers for Windows (CTRL+C) and termination
