@@ -8,7 +8,7 @@ import tempfile
 import math
 import time # Used in srt formatting
 import traceback
-
+import json
 import sv_ttk # For detailed error logging
 
 # Attempt imports and provide guidance if missing
@@ -81,7 +81,7 @@ class WhisperXApp:
     def __init__(self, master):
         self.master = master
         self.master.title("WhisperX SRT Generator")
-        self.master.geometry("650x800") # Increased height for VAD options
+        self.master.geometry("1150x700") # Increased height for VAD options
 
         # --- Input/Output ---
         self.file_path = tk.StringVar()
@@ -142,7 +142,6 @@ class WhisperXApp:
         self._create_widgets()
         self._check_ffmpeg()
 
-
     def _check_ffmpeg(self):
         # Checks ffmpeg
         try:
@@ -154,147 +153,429 @@ class WhisperXApp:
             # Don't disable run button here, do it in _set_ui_state
             # self.run_button.config(state=tk.DISABLED)
 
+    def _load_config(self):
+        # Load settings
+        if not self._CONFIG_FILE.exists():
+            print("Config file not found, using defaults.")  # Debug msg
+            return  # No file, use defaults
+
+        try:
+            with open(self._CONFIG_FILE, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+        except (IOError, json.JSONDecodeError) as e:
+            print(f"Error loading config: {e}")  # Log error
+            messagebox.showwarning(
+                "Config Load Error",
+                f"Could not load settings from {self._CONFIG_FILE}:\n{e}\n\nUsing default settings.",
+            )
+            # Optionally delete corrupted file: os.remove(self._CONFIG_FILE)
+            return
+
+        loaded_count = 0
+        for key, tk_var in self._savable_vars.items():
+            if key in config_data:
+                try:
+                    # Handle boolean specifically for tk.BooleanVar
+                    if isinstance(tk_var, tk.BooleanVar):
+                        value = bool(config_data[key])
+                    else:
+                        value = config_data[key]
+
+                    # Handle device restrictions if needed
+                    if (
+                        key == "device"
+                        and value == "cuda"
+                        and not torch.cuda.is_available()
+                    ):
+                        print(
+                            f"Config specified CUDA but not available, defaulting to CPU."
+                        )  # Log info
+                        tk_var.set("cpu")  # Fallback
+                    else:
+                        tk_var.set(value)
+                    loaded_count += 1
+                except (tk.TclError, TypeError, ValueError) as e:
+                    # Handle potential type mismatch or invalid value
+                    print(
+                        f"Error setting value for '{key}' from config: {e}. Skipping."
+                    )  # Log error
+                    # Keep default value for this variable
+
+        if loaded_count > 0:
+            print(
+                f"Loaded {loaded_count} settings from {self._CONFIG_FILE}"
+            )  # Log info
+            # Update dependent widgets like compute_type combo after loading
+            self._update_compute_type_options()  # Update dependent UI
+        else:
+            print("Config file existed but contained no matching settings.")  # Log info
+
+    def _save_config(self):
+        # Save settings
+        config_data = {}
+        for key, tk_var in self._savable_vars.items():
+            try:
+                config_data[key] = tk_var.get()
+            except tk.TclError as e:
+                print(
+                    f"Error getting value for '{key}': {e}. Skipping save."
+                )  # Log error
+
+        if not config_data:
+            print("No data to save.")  # Log info
+            return  # Nothing to save
+
+        try:
+            # Ensure parent directory exists (though ~ usually does)
+            self._CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, indent=4)  # Pretty print
+            print(
+                f"Saved {len(config_data)} settings to {self._CONFIG_FILE}"
+            )  # Log info
+        except IOError as e:
+            print(f"Error saving config: {e}")  # Log error
+            messagebox.showerror(
+                "Config Save Error",
+                f"Could not save settings to {self._CONFIG_FILE}:\n{e}",
+            )
+
+    def _on_closing(self):
+        # Handle window close event
+        self._save_config()  # Save settings
+        self.master.destroy()  # Close window
+
+    def _check_ffmpeg(self):
+        # Check if FFmpeg is accessible
+        try:
+            subprocess.run(
+                ["ffmpeg", "-version"],
+                check=True,
+                capture_output=True,
+                startupinfo=(
+                    subprocess.STARTUPINFO(
+                        dwFlags=subprocess.STARTF_USESHOWWINDOW,
+                        wShowWindow=subprocess.SW_HIDE,
+                    )
+                    if os.name == "nt"
+                    else None
+                ),
+            )
+            self._update_status("FFmpeg found.", clear_after=5000)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            self._update_status(
+                "FFmpeg not found! Install & add to PATH.", is_error=True
+            )
+            messagebox.showerror(
+                "Error", "FFmpeg not found. Install FFmpeg & add to PATH."
+            )
 
     def _create_widgets(self):
-        # Main Frame
+        # Main container
         main_frame = ttk.Frame(self.master, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # --- File Selection ---
-        file_frame = ttk.LabelFrame(main_frame, text="Input File", padding="10")
-        file_frame.pack(fill=tk.X, pady=5)
-        file_frame.columnconfigure(1, weight=1)
+        # Status bar at bottom
+        self.status_label = ttk.Label(
+            main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W
+        )
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0), ipady=2)
 
-        ttk.Label(file_frame, text="Video/Audio:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Entry(file_frame, textvariable=self.file_path, width=50).grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
-        ttk.Button(file_frame, text="Browse...", command=self._select_file).grid(row=0, column=2, padx=5, pady=5)
+        # Control frame (button, progress) above status bar
+        control_frame = ttk.Frame(main_frame, padding="5 0 5 0")  # Pad top/bottom
+        control_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
 
-        # --- Model & Compute Options ---
-        model_compute_frame = ttk.LabelFrame(main_frame, text="Model & Compute Settings", padding="10")
-        model_compute_frame.pack(fill=tk.X, pady=5)
-        model_compute_frame.columnconfigure(1, weight=1)
-        model_compute_frame.columnconfigure(3, weight=1)
+        self.run_button = ttk.Button(
+            control_frame, text="Generate SRT", command=self._run_transcription
+        )
+        self.run_button.pack(side=tk.LEFT, padx=(0, 5))  # Adjust padding
 
-        ttk.Label(model_compute_frame, text="Model Size:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        model_combo = ttk.Combobox(model_compute_frame, textvariable=self.model_size,
-                                   values=['tiny', 'base', 'small', 'medium', 'large-v1', 'large-v2', 'large-v3'], state="readonly")
-        model_combo.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
-
-        ttk.Label(model_compute_frame, text="Device:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
-        device_opts = ['cpu']
-        if torch.cuda.is_available():
-            device_opts.insert(0, 'cuda') # Prioritize cuda
-        device_combo = ttk.Combobox(model_compute_frame, textvariable=self.device, values=device_opts, state="readonly")
-        device_combo.grid(row=0, column=3, padx=5, pady=5, sticky=tk.EW)
-        device_combo.bind("<<ComboboxSelected>>", self._update_compute_type_options)
-
-        ttk.Label(model_compute_frame, text="Compute Type:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        self.compute_type_combo = ttk.Combobox(model_compute_frame, textvariable=self.compute_type, state="readonly")
-        self.compute_type_combo.grid(row=1, column=1, padx=5, pady=5, sticky=tk.EW)
-        self._update_compute_type_options()
-
-        ttk.Label(model_compute_frame, text="Batch Size:").grid(row=1, column=2, padx=5, pady=5, sticky=tk.W)
-        ttk.Spinbox(model_compute_frame, from_=1, to=128, textvariable=self.batch_size, width=10).grid(row=1, column=3, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Label(model_compute_frame, text="Language:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Entry(model_compute_frame, textvariable=self.language).grid(row=2, column=1, padx=5, pady=5, sticky=tk.EW)
-        ttk.Label(model_compute_frame, text="(blank=auto)").grid(row=2, column=2, columnspan=2, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Label(model_compute_frame, text="HF Token:").grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Entry(model_compute_frame, textvariable=self.hf_token, show="*").grid(row=3, column=1, padx=5, pady=5, sticky=tk.EW)
-        ttk.Label(model_compute_frame, text="(optional, needed for diarize)").grid(row=3, column=2, columnspan=2, padx=5, pady=5, sticky=tk.W)
-
-
-        # --- Processing Options ---
-        process_frame = ttk.LabelFrame(main_frame, text="Processing Stages", padding="10")
-        process_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Checkbutton(process_frame, text="Align Transcription (better timing)", variable=self.align_model_flag).grid(row=0, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
-        ttk.Checkbutton(process_frame, text="Diarize Speakers (needs align & HF token)", variable=self.diarize_flag).grid(row=1, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
-
-        # --- VAD Options ---
-        vad_frame = ttk.LabelFrame(main_frame, text="VAD (Voice Activity Detection)", padding="10")
-        vad_frame.pack(fill=tk.X, pady=5)
-        vad_frame.columnconfigure(1, weight=1)
-        vad_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(vad_frame, text="VAD Threshold:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
-        ttk.Entry(vad_frame, textvariable=self.vad_threshold_var, width=10).grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
-        ttk.Label(vad_frame, text="(0-1, lower=more sensitive)").grid(row=0, column=2, columnspan=2, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(vad_frame, text="Min Speech (ms):").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
-        ttk.Spinbox(vad_frame, from_=10, to=10000, textvariable=self.min_speech_dur_var, width=7).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(vad_frame, text="Min Silence (ms):").grid(row=1, column=2, padx=5, pady=2, sticky=tk.W)
-        ttk.Spinbox(vad_frame, from_=10, to=10000, textvariable=self.min_silence_dur_var, width=7).grid(row=1, column=3, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(vad_frame, text="Speech Pad (ms):").grid(row=2, column=0, padx=5, pady=2, sticky=tk.W)
-        ttk.Spinbox(vad_frame, from_=0, to=5000, textvariable=self.speech_pad_var, width=7).grid(row=2, column=1, padx=5, pady=2, sticky=tk.W)
-
-
-        # --- ASR Advanced Options ---
-        asr_frame = ttk.LabelFrame(main_frame, text="ASR Fine-tuning", padding="10")
-        asr_frame.pack(fill=tk.X, pady=5)
-        asr_frame.columnconfigure(1, weight=1)
-        asr_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(asr_frame, text="Beam Size:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
-        ttk.Spinbox(asr_frame, from_=1, to=50, textvariable=self.beam_size_var, width=7).grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(asr_frame, text="Best Of:").grid(row=0, column=2, padx=5, pady=2, sticky=tk.W)
-        ttk.Spinbox(asr_frame, from_=1, to=50, textvariable=self.best_of_var, width=7).grid(row=0, column=3, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(asr_frame, text="Log Prob Thresh:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
-        ttk.Entry(asr_frame, textvariable=self.log_prob_thresh_var, width=10).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(asr_frame, text="No Speech Thresh:").grid(row=1, column=2, padx=5, pady=2, sticky=tk.W)
-        ttk.Entry(asr_frame, textvariable=self.no_speech_thresh_var, width=10).grid(row=1, column=3, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(asr_frame, text="Length Penalty:").grid(row=2, column=0, padx=5, pady=2, sticky=tk.W)
-        ttk.Entry(asr_frame, textvariable=self.length_penalty_var, width=10).grid(row=2, column=1, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Checkbutton(asr_frame, text="Cond. on Prev Text", variable=self.condition_prev_text_var).grid(row=3, column=0, padx=5, pady=2, sticky=tk.W)
-        ttk.Checkbutton(asr_frame, text="Suppress Numerals", variable=self.suppress_numerals_var).grid(row=3, column=2, padx=5, pady=2, sticky=tk.W)
-
-        # --- Diarize Options Frame ---
-        diarize_frame = ttk.LabelFrame(main_frame, text="Diarization Options", padding="10")
-        diarize_frame.pack(fill=tk.X, pady=5)
-        diarize_frame.columnconfigure(1, weight=1)
-        diarize_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(diarize_frame, text="Min Speakers:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
-        ttk.Entry(diarize_frame, textvariable=self.min_speakers_var, width=10).grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
-        ttk.Label(diarize_frame, text="(blank=auto)").grid(row=0, column=2, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(diarize_frame, text="Max Speakers:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
-        ttk.Entry(diarize_frame, textvariable=self.max_speakers_var, width=10).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
-        ttk.Label(diarize_frame, text="(blank=auto)").grid(row=1, column=2, padx=5, pady=2, sticky=tk.W)
-
-
-        # --- SRT Formatting Options ---
-        srt_frame = ttk.LabelFrame(main_frame, text="SRT Formatting", padding="10")
-        srt_frame.pack(fill=tk.X, pady=5)
-        srt_frame.columnconfigure(1, weight=1)
-        srt_frame.columnconfigure(3, weight=1)
-
-        ttk.Label(srt_frame, text="Max Line Length:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Spinbox(srt_frame, from_=10, to=200, textvariable=self.srt_max_len_var, width=7).grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Label(srt_frame, text="Max Lines/Caption:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
-        ttk.Spinbox(srt_frame, from_=1, to=10, textvariable=self.srt_max_lines_var, width=7).grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
-
-        # --- Controls & Status ---
-        control_frame = ttk.Frame(main_frame, padding="10")
-        control_frame.pack(fill=tk.X, pady=5)
-
-        self.run_button = ttk.Button(control_frame, text="Generate SRT", command=self._run_transcription)
-        self.run_button.pack(side=tk.LEFT, padx=5)
-
-        self.progress_bar = ttk.Progressbar(control_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar = ttk.Progressbar(
+            control_frame, variable=self.progress_var, maximum=100
+        )
         self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
-        self.status_label = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(5,0))
+        # Two-column layout frame (fills remaining space)
+        content_frame = ttk.Frame(main_frame)
+        content_frame.pack(fill=tk.BOTH, expand=True)
+        content_frame.columnconfigure(0, weight=1)  # Left col
+        content_frame.columnconfigure(1, weight=1)  # Right col
+        content_frame.rowconfigure(0, weight=1)  # Allow rows to expand if needed
+
+        # --- Left Column ---
+        left_column = ttk.Frame(content_frame, padding="5")
+        left_column.grid(
+            row=0, column=0, sticky="nsew", padx=(0, 5)
+        )  # Add padding between cols
+
+        # File Input (Left Col)
+        file_frame = ttk.LabelFrame(left_column, text="Input File", padding="10")
+        file_frame.pack(fill=tk.X, pady=5)
+        file_frame.columnconfigure(1, weight=1)  # Make entry expand
+
+        ttk.Label(file_frame, text="Video/Audio:").grid(
+            row=0, column=0, padx=5, pady=5, sticky=tk.W
+        )
+        ttk.Entry(file_frame, textvariable=self.file_path, width=40).grid(
+            row=0, column=1, padx=5, pady=5, sticky=tk.EW
+        )  # Adjust width
+        ttk.Button(file_frame, text="Browse...", command=self._select_file).grid(
+            row=0, column=2, padx=5, pady=5
+        )
+
+        # Model & Compute Settings (Left Col)
+        model_compute_frame = ttk.LabelFrame(
+            left_column, text="Model & Compute Settings", padding="10"
+        )
+        model_compute_frame.pack(fill=tk.X, pady=5)
+        model_compute_frame.columnconfigure(
+            1, weight=1
+        )  # Make controls expand where needed
+
+        ttk.Label(model_compute_frame, text="Model Size:").grid(
+            row=0, column=0, padx=5, pady=5, sticky=tk.W
+        )
+        model_combo = ttk.Combobox(
+            model_compute_frame,
+            textvariable=self.model_size,
+            values=[
+                "tiny",
+                "base",
+                "small",
+                "medium",
+                "large-v1",
+                "large-v2",
+                "large-v3",
+                "large-v3-turbo",
+            ],
+            state="readonly",
+            width=10,
+        )
+        model_combo.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
+
+        ttk.Label(model_compute_frame, text="Device:").grid(
+            row=0, column=2, padx=5, pady=5, sticky=tk.W
+        )
+        device_opts = ["cpu"]
+        if torch.cuda.is_available():
+            device_opts.insert(0, "cuda")  # Prioritize cuda
+        # Use variable directly, values will be updated if loaded
+        device_combo = ttk.Combobox(
+            model_compute_frame,
+            textvariable=self.device,
+            values=device_opts,
+            state="readonly",
+            width=7,
+        )
+        device_combo.grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
+        device_combo.bind("<<ComboboxSelected>>", self._update_compute_type_options)
+
+        ttk.Label(model_compute_frame, text="Compute Type:").grid(
+            row=1, column=0, padx=5, pady=5, sticky=tk.W
+        )
+        # Values populated by _update_compute_type_options
+        self.compute_type_combo = ttk.Combobox(
+            model_compute_frame,
+            textvariable=self.compute_type,
+            state="readonly",
+            width=10,
+        )
+        self.compute_type_combo.grid(row=1, column=1, padx=5, pady=5, sticky=tk.EW)
+        self._update_compute_type_options()  # Populate based on current (possibly loaded) device
+
+        ttk.Label(model_compute_frame, text="Batch Size:").grid(
+            row=1, column=2, padx=5, pady=5, sticky=tk.W
+        )
+        ttk.Spinbox(
+            model_compute_frame, from_=1, to=128, textvariable=self.batch_size, width=5
+        ).grid(row=1, column=3, padx=5, pady=5, sticky=tk.W)
+
+        ttk.Label(model_compute_frame, text="Language:").grid(
+            row=2, column=0, padx=5, pady=5, sticky=tk.W
+        )
+        ttk.Entry(model_compute_frame, textvariable=self.language, width=10).grid(
+            row=2, column=1, padx=5, pady=5, sticky=tk.EW
+        )
+        ttk.Label(model_compute_frame, text="(blank=auto)").grid(
+            row=2, column=2, columnspan=2, padx=5, pady=5, sticky=tk.W
+        )
+
+        ttk.Label(model_compute_frame, text="HF Token:").grid(
+            row=3, column=0, padx=5, pady=5, sticky=tk.W
+        )
+        ttk.Entry(
+            model_compute_frame, textvariable=self.hf_token, show="*", width=10
+        ).grid(row=3, column=1, padx=5, pady=5, sticky=tk.EW)
+        ttk.Label(model_compute_frame, text="(opt, for diarize)").grid(
+            row=3, column=2, columnspan=2, padx=5, pady=5, sticky=tk.W
+        )  # Shorter text
+
+        # Processing Stages (Left Col)
+        process_frame = ttk.LabelFrame(
+            left_column, text="Processing Stages", padding="10"
+        )
+        process_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Checkbutton(
+            process_frame,
+            text="Align Transcription (better timing)",
+            variable=self.align_model_flag,
+        ).grid(row=0, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
+        ttk.Checkbutton(
+            process_frame,
+            text="Diarize Speakers (needs align & HF token)",
+            variable=self.diarize_flag,
+        ).grid(row=1, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
+
+        # VAD Options (Left Col)
+        vad_frame = ttk.LabelFrame(
+            left_column, text="VAD (Voice Activity Detection)", padding="10"
+        )
+        vad_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(vad_frame, text="VAD Thresh:").grid(
+            row=0, column=0, padx=5, pady=2, sticky=tk.W
+        )  # Shorter label
+        ttk.Entry(vad_frame, textvariable=self.vad_threshold_var, width=7).grid(
+            row=0, column=1, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Label(vad_frame, text="(0-1, lower=more sensitive)").grid(
+            row=0, column=2, columnspan=2, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(vad_frame, text="Min Speech (ms):").grid(
+            row=1, column=0, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Spinbox(
+            vad_frame,
+            from_=10,
+            to=10000,
+            increment=10,
+            textvariable=self.min_speech_dur_var,
+            width=5,
+        ).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(vad_frame, text="Min Silence (ms):").grid(
+            row=1, column=2, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Spinbox(
+            vad_frame,
+            from_=10,
+            to=10000,
+            increment=10,
+            textvariable=self.min_silence_dur_var,
+            width=5,
+        ).grid(row=1, column=3, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(vad_frame, text="Speech Pad (ms):").grid(
+            row=2, column=0, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Spinbox(
+            vad_frame,
+            from_=0,
+            to=5000,
+            increment=10,
+            textvariable=self.speech_pad_var,
+            width=5,
+        ).grid(row=2, column=1, padx=5, pady=2, sticky=tk.W)
+
+        # --- Right Column ---
+        right_column = ttk.Frame(content_frame, padding="5")
+        right_column.grid(
+            row=0, column=1, sticky="nsew", padx=(5, 0)
+        )  # Add padding between cols
+
+        # ASR Fine-tuning (Right Col)
+        asr_frame = ttk.LabelFrame(right_column, text="ASR Fine-tuning", padding="10")
+        asr_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(asr_frame, text="Beam Size:").grid(
+            row=0, column=0, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Spinbox(
+            asr_frame, from_=1, to=50, textvariable=self.beam_size_var, width=5
+        ).grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(asr_frame, text="Best Of:").grid(
+            row=0, column=2, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Spinbox(
+            asr_frame, from_=1, to=50, textvariable=self.best_of_var, width=5
+        ).grid(row=0, column=3, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(asr_frame, text="Log Prob Thresh:").grid(
+            row=1, column=0, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Entry(asr_frame, textvariable=self.log_prob_thresh_var, width=7).grid(
+            row=1, column=1, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(asr_frame, text="No Speech Thresh:").grid(
+            row=1, column=2, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Entry(asr_frame, textvariable=self.no_speech_thresh_var, width=7).grid(
+            row=1, column=3, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(asr_frame, text="Length Penalty:").grid(
+            row=2, column=0, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Entry(asr_frame, textvariable=self.length_penalty_var, width=7).grid(
+            row=2, column=1, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Checkbutton(
+            asr_frame, text="Cond. on Prev Text", variable=self.condition_prev_text_var
+        ).grid(row=3, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
+        ttk.Checkbutton(
+            asr_frame, text="Suppress Numerals", variable=self.suppress_numerals_var
+        ).grid(row=3, column=2, columnspan=2, padx=5, pady=2, sticky=tk.W)
+
+        # Diarization Options (Right Col)
+        diarize_frame = ttk.LabelFrame(
+            right_column, text="Diarization Options", padding="10"
+        )
+        diarize_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(diarize_frame, text="Min Speakers:").grid(
+            row=0, column=0, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Entry(diarize_frame, textvariable=self.min_speakers_var, width=7).grid(
+            row=0, column=1, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Label(diarize_frame, text="(blank=auto)").grid(
+            row=0, column=2, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(diarize_frame, text="Max Speakers:").grid(
+            row=1, column=0, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Entry(diarize_frame, textvariable=self.max_speakers_var, width=7).grid(
+            row=1, column=1, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Label(diarize_frame, text="(blank=auto)").grid(
+            row=1, column=2, padx=5, pady=2, sticky=tk.W
+        )
+
+        # SRT Formatting (Right Col)
+        srt_frame = ttk.LabelFrame(right_column, text="SRT Formatting", padding="10")
+        srt_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(srt_frame, text="Max Line Len:").grid(
+            row=0, column=0, padx=5, pady=5, sticky=tk.W
+        )  # Shorter label
+        ttk.Spinbox(
+            srt_frame, from_=10, to=200, textvariable=self.srt_max_len_var, width=5
+        ).grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+
+        ttk.Label(srt_frame, text="Max Lines/Cap:").grid(
+            row=0, column=2, padx=5, pady=5, sticky=tk.W
+        )  # Shorter label
+        ttk.Spinbox(
+            srt_frame, from_=1, to=10, textvariable=self.srt_max_lines_var, width=5
+        ).grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
+
+    # --- Assume other methods like _select_file, _run_transcription, _update_status exist ---
 
     def _update_compute_type_options(self, event=None):
         # Update compute type based on device
@@ -333,10 +614,9 @@ class WhisperXApp:
         self.master.update_idletasks() # Ensure UI updates immediately
 
         if clear_after:
-             # Use lambda to capture current message for comparison
-             current_msg = message
-             self.master.after(clear_after, lambda: self.status_var.set("Ready") if self.status_var.get() == current_msg else None)
-
+            # Use lambda to capture current message for comparison
+            current_msg = message
+            self.master.after(clear_after, lambda: self.status_var.set("Ready") if self.status_var.get() == current_msg else None)
 
     def _set_ui_state(self, state):
         # Disables/enables gui
@@ -353,9 +633,8 @@ class WhisperXApp:
                 subprocess.run(["ffmpeg", "-version"], check=True, capture_output=True, text=True)
                 self.run_button.config(text="Generate SRT", state=tk.NORMAL)
             except (subprocess.CalledProcessError, FileNotFoundError):
-                 self.run_button.config(text="Generate SRT", state=tk.DISABLED) # Keep disabled if ffmpeg missing
-                 self._update_status("FFmpeg not found! Cannot run.", is_error=True) # Keep error visible
-
+                self.run_button.config(text="Generate SRT", state=tk.DISABLED) # Keep disabled if ffmpeg missing
+                self._update_status("FFmpeg not found! Cannot run.", is_error=True) # Keep error visible
 
     def _recursive_set_state(self, widget, state):
         # Helper for _set_ui_state
@@ -371,7 +650,6 @@ class WhisperXApp:
             pass
         except AttributeError: # Ignore widgets without winfo_children (e.g., scrollbars)
             pass
-
 
     def _run_transcription(self):
         # Starts process thread
@@ -424,11 +702,11 @@ class WhisperXApp:
             self.srt_options = {**self._default_srt_options, **gui_srt_options}
 
         except tk.TclError as e: # Catch errors getting values (e.g., invalid float)
-             messagebox.showerror("Invalid Option", f"Please check your numeric option values: {e}")
-             return
+            messagebox.showerror("Invalid Option", f"Please check your numeric option values: {e}")
+            return
         except ValueError as e: # Catch int conversion errors for speakers
-             messagebox.showerror("Invalid Option", f"Speaker counts must be numbers (or blank): {e}")
-             return
+            messagebox.showerror("Invalid Option", f"Speaker counts must be numbers (or blank): {e}")
+            return
 
         # --- Start Processing ---
         self._set_ui_state(tk.DISABLED)
@@ -436,7 +714,6 @@ class WhisperXApp:
 
         self.processing_thread = threading.Thread(target=self._processing_task, args=(input_file,), daemon=True)
         self.processing_thread.start()
-
 
     def _load_models(self, load_diarization: bool):
         """Load VAD, Whisper, and optionally Diarization models lazily."""
@@ -500,7 +777,6 @@ class WhisperXApp:
             # Propagate model loading errors (VAD/Whisper)
             raise RuntimeError(f"Core model loading failed: {e}") from e
 
-
     def _format_timestamp(self, seconds: float) -> str:
         # Formats seconds to SRT time
         assert seconds >= 0, "non-negative timestamp expected"
@@ -559,7 +835,7 @@ class WhisperXApp:
                 # Add speaker prefix only to the first line of the chunk
                 srt_content += speaker + chunk_lines[0] + "\n"
                 for line in chunk_lines[1:]:
-                     srt_content += line + "\n"
+                    srt_content += line + "\n"
                 srt_content += "\n" # Blank line
                 count += 1
         return srt_content
@@ -589,14 +865,13 @@ class WhisperXApp:
                 try:
                     subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0) # Hide console on windows
                 except subprocess.CalledProcessError as e:
-                     raise RuntimeError(f"FFmpeg Error: {e.stderr or e.stdout or 'Unknown'}") from e
+                    raise RuntimeError(f"FFmpeg Error: {e.stderr or e.stdout or 'Unknown'}") from e
                 except FileNotFoundError:
                     raise RuntimeError("FFmpeg not found.") from None
 
             current_progress = 15
             self.master.after(0, self._update_status, "Loading audio data...", current_progress)
             audio = whisperx.load_audio(audio_path) # Load the audio file
-
 
             # --- 2. Load VAD, Whisper, and maybe Diarization Models ---
             # Note: Alignment model is loaded later if needed & lang is auto
@@ -614,25 +889,23 @@ class WhisperXApp:
                 )
 
             except Exception as e:
-                 raise RuntimeError(f"Transcription failed: {e}") from e
+                raise RuntimeError(f"Transcription failed: {e}") from e
 
             # --- Determine Language Code for Alignment ---
             # Use specified language, otherwise use detected language from result
             language_code = self.language.get() or result.get("language")
             if not language_code:
-                 # If language still unknown, alignment cannot proceed
-                 print("Warning: Language code unknown after transcription. Cannot perform alignment.")
-                 do_align = False # Disable alignment if language is missing
+                # If language still unknown, alignment cannot proceed
+                print("Warning: Language code unknown after transcription. Cannot perform alignment.")
+                do_align = False # Disable alignment if language is missing
             else:
                 # Ensure language is set in GUI if auto-detected for clarity
-                 if not self.language.get():
-                     self.master.after(0, self.language.set, language_code) # Update GUI var
-                     print(f"Detected language: {language_code}")
-
+                if not self.language.get():
+                    self.master.after(0, self.language.set, language_code) # Update GUI var
+                    print(f"Detected language: {language_code}")
 
             current_progress = 60 # Approx progress after transcription
             self.master.after(0, self._update_status, "Transcription complete.", current_progress)
-
 
             # --- 4. Load Alignment Model (if needed and lang known) ---
             if do_align and self.align_model is None: # Only load if needed and not already loaded
@@ -644,11 +917,10 @@ class WhisperXApp:
                     current_progress += 7
                     self.master.after(0, self._update_status, "Alignment model loaded.", current_progress)
                 except Exception as e:
-                     # If specific lang model not found, align_model remains None
-                     print(f"Warning: Could not load alignment model for '{language_code}': {e}. Alignment will be skipped.")
-                     self.master.after(0, self._update_status, f"Warning: Alignment model for '{language_code}' not found. Skipping alignment.", current_progress, False, 5000)
-                     do_align = False # Disable alignment step
-
+                    # If specific lang model not found, align_model remains None
+                    print(f"Warning: Could not load alignment model for '{language_code}': {e}. Alignment will be skipped.")
+                    self.master.after(0, self._update_status, f"Warning: Alignment model for '{language_code}' not found. Skipping alignment.", current_progress, False, 5000)
+                    do_align = False # Disable alignment step
 
             # --- 5. Align (if enabled and model loaded) ---
             if do_align: # Re-check flag in case loading failed
@@ -670,8 +942,8 @@ class WhisperXApp:
                             # This case should ideally not happen if transcribe worked
                             raise RuntimeError("Alignment failed and transcription result format is unexpected.") from e
                 else:
-                     # This case should be covered by the loading step warning
-                     pass # Already warned if model didn't load
+                    # This case should be covered by the loading step warning
+                    pass # Already warned if model didn't load
 
             # --- 6. Diarize (if enabled and model loaded) ---
             # Make sure alignment was intended OR transcription provides timestamps
@@ -680,12 +952,12 @@ class WhisperXApp:
 
             if do_diarize: # Check user intent first
                 if not do_align and not self.align_model_flag.get(): # Warn if user disabled align but wants diarize
-                     self.master.after(0, self._update_status, "Warning: Diarization works best with alignment enabled.", current_progress + 1, False, 5000)
+                    self.master.after(0, self._update_status, "Warning: Diarization works best with alignment enabled.", current_progress + 1, False, 5000)
 
                 if not self.diarize_model:
                     self.master.after(0, self._update_status, "Skipping diarization (model not loaded).", current_progress + 1)
                 elif not can_diarize:
-                     self.master.after(0, self._update_status, "Warning: Cannot diarize (segments missing or lack timestamps). Skipping.", current_progress + 1)
+                    self.master.after(0, self._update_status, "Warning: Cannot diarize (segments missing or lack timestamps). Skipping.", current_progress + 1)
                 else:
                     # Proceed with diarization
                     self.master.after(0, self._update_status, "Performing diarization...", current_progress + 2)
@@ -712,14 +984,12 @@ class WhisperXApp:
                         print(f"ERROR during diarization: {e}\n{traceback.format_exc()}")
                         self.master.after(0, self._update_status, f"Diarization failed: {e}. Skipping speakers.", current_progress + 5, True)
 
-
             # --- 7. Generate SRT ---
             current_progress = 95 # Progress before final save
             self.master.after(0, self._update_status, "Generating SRT file...", current_progress)
             if not isinstance(result, dict) or 'segments' not in result or not result['segments']:
-                 raise ValueError("No valid segments found in the result to generate SRT.")
+                raise ValueError("No valid segments found in the result to generate SRT.")
             srt_content = self._generate_srt(result["segments"])
-
 
             # --- 8. Save SRT ---
             with open(output_srt_file, 'w', encoding='utf-8') as f:
@@ -764,13 +1034,12 @@ class WhisperXApp:
             result = None # Clear result reference
             audio = None # Clear audio data reference
 
-
             if self.device.get() == 'cuda':
                 try:
                     print("Clearing CUDA cache...")
                     torch.cuda.empty_cache()
                 except Exception as cache_e:
-                     print(f"Note: Error during CUDA cache clearing: {cache_e}")
+                    print(f"Note: Error during CUDA cache clearing: {cache_e}")
 
             # Delete temporary audio file
             if temp_audio_file and os.path.exists(temp_audio_file):
@@ -786,7 +1055,7 @@ class WhisperXApp:
             final_status = self.status_var.get()
             is_error_displayed = self.status_label.cget("foreground") == "red"
             if not is_error_displayed or "Success" in final_status: # Clear if success or non-error state
-                 self.master.after(100, self._update_status, "Finished.", 0) # Reset progress and status
+                self.master.after(100, self._update_status, "Finished.", 0) # Reset progress and status
 
 
 if __name__ == "__main__":
