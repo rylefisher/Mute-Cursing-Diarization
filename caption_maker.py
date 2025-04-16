@@ -1,1065 +1,667 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
-import subprocess
-import threading
-import os
-import sys
-import tempfile
-import math
-import time # Used in srt formatting
-import traceback
+from tkinter import filedialog, messagebox, scrolledtext
 import json
-import sv_ttk # For detailed error logging
+import os
+import threading
+import gc
+import torch
+from typing import List, Dict, Any
 
-# Attempt imports and provide guidance if missing
-try:
-    import torch
-except ImportError:
-    messagebox.showerror("Error", "PyTorch not found. Please install it (see PyTorch website).")
-    sys.exit(1)
-
+# --- WhisperX Import ---
 try:
     import whisperx
-    import whisperx.vad # Explicitly import vad
 except ImportError:
-    messagebox.showerror("Error", "WhisperX not found. Please install it (`pip install -U whisperx`). Ensure Faster-Whisper dependencies are met.")
-    sys.exit(1)
+    print("Error: whisperx not found.")  # Explain: Lib not found
+    print(
+        "Please install it: pip install git+https://github.com/m-bain/whisperX.git"
+    )  # Explain: Install cmd
+    exit()
 
-class WhisperXApp:
-    # --- Default Options (Based on user context) ---
-    _default_asr_options = {
-        "log_prob_threshold": -3.0, # Accept low confidence words
-        "no_speech_threshold": 0.1, # Catch quieter speech
-        "temperatures": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0], # Robustness
-        "condition_on_previous_text": True, # Context for long audio
-        "compression_ratio_threshold": None, # Disable filter
-        "word_timestamps": True, # Needed for alignment
-        "without_timestamps": False,
-        "beam_size": 5, # Balance accuracy/speed
-        "best_of": 5, # Balance accuracy/speed
-        "patience": None, # Faster decoding
-        "length_penalty": 1.0,
-        "repetition_penalty": 1.0,
-        "no_repeat_ngram_size": 0,
-        "prompt_reset_on_temperature": 0.5,
-        "initial_prompt": None,
-        "prefix": None,
-        "suppress_blank": True,
-        "suppress_tokens": [], # Ensure no tokens suppressed
-        "max_initial_timestamp": 1.0,
-        "prepend_punctuations": "",
-        "append_punctuations": "",
-        "suppress_numerals": False,
-        "max_new_tokens": None,
-        "clip_timestamps": "0",
-        "hallucination_silence_threshold": None,
-        "hotwords": None, # Could add curses if needed
-    }
-    _default_vad_options = {
-        "vad_threshold": 0.15, # VAD sensitivity
-        "min_speech_duration_ms": 50, # Catch short speech
-        "max_speech_duration_s": float("inf"),
-        "min_silence_duration_ms": 300, # Silence duration sensitivity
-        "window_size_samples": 1024, # Default from whisperx example
-        "speech_pad_ms": 500, # Padding around speech
-    }
-    # Note: transcribe_config like chunk_size is often handled internally by load_model/transcribe
-    # We'll keep batch_size from the GUI for the model.transcribe call
-    _default_align_config = {
-        "return_char_alignments": False,  # Not needed for words
-    }
-    _default_diarize_options = {
-        "min_speakers": None,  # Auto-detect
-        "max_speakers": None,  # Auto-detect or set upper limit
-    }
-    # SRT formatting defaults (kept separate)
-    _default_srt_options = {
-        "max_line_len": 42,
-        "max_lines": 2,
-    }
+# --- Configuration ---
+CONFIG_FILE = "whisperx_gui_config.json"
+DEFAULT_CONFIG = {
+    "audio_file_path": "",
+    "speaker_names_str": "Speaker 1,Speaker 2",
+    "chars_per_line": "42",
+    "max_lines_per_entry": "2",  # Max lines config
+    "model_size": "base",
+    "hf_token": "",  # Default no token
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "compute_type": ("float16" if torch.cuda.is_available() else "int8"),
+}
 
-    def __init__(self, master):
-        self.master = master
-        self.master.title("WhisperX SRT Generator")
-        self.master.geometry("1150x700") # Increased height for VAD options
 
-        # --- Input/Output ---
-        self.file_path = tk.StringVar()
-
-        # --- Core Settings ---
-        self.model_size = tk.StringVar(value='base')
-        self.device = tk.StringVar(value='cuda' if torch.cuda.is_available() else 'cpu')
-        self.compute_type = tk.StringVar(value='float16' if torch.cuda.is_available() else 'int8')
-        self.batch_size = tk.IntVar(value=16)
-        self.language = tk.StringVar(value='') # Empty for auto-detect
-        self.hf_token = tk.StringVar(value='') # Hugging Face Token
-
-        # --- Processing Flags ---
-        self.align_model_flag = tk.BooleanVar(value=True) # Renamed to avoid conflict
-        self.diarize_flag = tk.BooleanVar(value=False) # Renamed
-
-        # --- ASR Options ---
-        self.beam_size_var = tk.IntVar(value=self._default_asr_options['beam_size'])
-        self.best_of_var = tk.IntVar(value=self._default_asr_options['best_of'])
-        self.log_prob_thresh_var = tk.DoubleVar(value=self._default_asr_options['log_prob_threshold'])
-        self.no_speech_thresh_var = tk.DoubleVar(value=self._default_asr_options['no_speech_threshold'])
-        self.condition_prev_text_var = tk.BooleanVar(value=self._default_asr_options['condition_on_previous_text'])
-        self.length_penalty_var = tk.DoubleVar(value=self._default_asr_options['length_penalty'])
-        self.suppress_numerals_var = tk.BooleanVar(value=self._default_asr_options['suppress_numerals'])
-
-        # --- VAD Options ---
-        self.vad_threshold_var = tk.DoubleVar(value=self._default_vad_options['vad_threshold'])
-        self.min_speech_dur_var = tk.IntVar(value=self._default_vad_options['min_speech_duration_ms'])
-        self.min_silence_dur_var = tk.IntVar(value=self._default_vad_options['min_silence_duration_ms'])
-        self.speech_pad_var = tk.IntVar(value=self._default_vad_options['speech_pad_ms'])
-
-        # --- Diarize Options ---
-        self.min_speakers_var = tk.StringVar(value=str(self._default_diarize_options['min_speakers'] or '')) # Store as string for Entry
-        self.max_speakers_var = tk.StringVar(value=str(self._default_diarize_options['max_speakers'] or '')) # Store as string for Entry
-
-        # --- SRT Options ---
-        self.srt_max_len_var = tk.IntVar(value=self._default_srt_options['max_line_len'])
-        self.srt_max_lines_var = tk.IntVar(value=self._default_srt_options['max_lines'])
-
-        # --- Status/Progress ---
-        self.status_var = tk.StringVar(value="Ready")
-        self.progress_var = tk.DoubleVar(value=0)
-
-        # --- Model Placeholders ---
-        self.vad_model = None
-        self.whisper_model = None
-        self.align_model = None
-        self.align_metadata = None
-        self.diarize_model = None
-
-        # --- Runtime Merged Options (populated before processing) ---
-        self.asr_options = {}
-        self.vad_options = {}
-        self.align_config = {}
-        self.diarize_options = {}
-        self.srt_options = {} # For SRT formatting
-
-        self._create_widgets()
-        self._check_ffmpeg()
-
-    def _check_ffmpeg(self):
-        # Checks ffmpeg
+def load_config() -> Dict[str, Any]:
+    """Loads config from file or returns defaults."""
+    if os.path.exists(CONFIG_FILE):
         try:
-            subprocess.run(["ffmpeg", "-version"], check=True, capture_output=True)
-            self._update_status("FFmpeg found.", clear_after=5000)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            self._update_status("FFmpeg not found! Please install FFmpeg and ensure it's in your PATH.", is_error=True)
-            messagebox.showerror("Error", "FFmpeg not found. Please install FFmpeg and ensure it's in your system's PATH.")
-            # Don't disable run button here, do it in _set_ui_state
-            # self.run_button.config(state=tk.DISABLED)
-
-    def _load_config(self):
-        # Load settings
-        if not self._CONFIG_FILE.exists():
-            print("Config file not found, using defaults.")  # Debug msg
-            return  # No file, use defaults
-
-        try:
-            with open(self._CONFIG_FILE, "r", encoding="utf-8") as f:
-                config_data = json.load(f)
-        except (IOError, json.JSONDecodeError) as e:
-            print(f"Error loading config: {e}")  # Log error
-            messagebox.showwarning(
-                "Config Load Error",
-                f"Could not load settings from {self._CONFIG_FILE}:\n{e}\n\nUsing default settings.",
-            )
-            # Optionally delete corrupted file: os.remove(self._CONFIG_FILE)
-            return
-
-        loaded_count = 0
-        for key, tk_var in self._savable_vars.items():
-            if key in config_data:
-                try:
-                    # Handle boolean specifically for tk.BooleanVar
-                    if isinstance(tk_var, tk.BooleanVar):
-                        value = bool(config_data[key])
-                    else:
-                        value = config_data[key]
-
-                    # Handle device restrictions if needed
-                    if (
-                        key == "device"
-                        and value == "cuda"
-                        and not torch.cuda.is_available()
-                    ):
-                        print(
-                            f"Config specified CUDA but not available, defaulting to CPU."
-                        )  # Log info
-                        tk_var.set("cpu")  # Fallback
-                    else:
-                        tk_var.set(value)
-                    loaded_count += 1
-                except (tk.TclError, TypeError, ValueError) as e:
-                    # Handle potential type mismatch or invalid value
-                    print(
-                        f"Error setting value for '{key}' from config: {e}. Skipping."
-                    )  # Log error
-                    # Keep default value for this variable
-
-        if loaded_count > 0:
-            print(
-                f"Loaded {loaded_count} settings from {self._CONFIG_FILE}"
-            )  # Log info
-            # Update dependent widgets like compute_type combo after loading
-            self._update_compute_type_options()  # Update dependent UI
-        else:
-            print("Config file existed but contained no matching settings.")  # Log info
-
-    def _save_config(self):
-        # Save settings
-        config_data = {}
-        for key, tk_var in self._savable_vars.items():
-            try:
-                config_data[key] = tk_var.get()
-            except tk.TclError as e:
-                print(
-                    f"Error getting value for '{key}': {e}. Skipping save."
-                )  # Log error
-
-        if not config_data:
-            print("No data to save.")  # Log info
-            return  # Nothing to save
-
-        try:
-            # Ensure parent directory exists (though ~ usually does)
-            self._CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config_data, f, indent=4)  # Pretty print
-            print(
-                f"Saved {len(config_data)} settings to {self._CONFIG_FILE}"
-            )  # Log info
-        except IOError as e:
-            print(f"Error saving config: {e}")  # Log error
-            messagebox.showerror(
-                "Config Save Error",
-                f"Could not save settings to {self._CONFIG_FILE}:\n{e}",
-            )
-
-    def _on_closing(self):
-        # Handle window close event
-        self._save_config()  # Save settings
-        self.master.destroy()  # Close window
-
-    def _check_ffmpeg(self):
-        # Check if FFmpeg is accessible
-        try:
-            subprocess.run(
-                ["ffmpeg", "-version"],
-                check=True,
-                capture_output=True,
-                startupinfo=(
-                    subprocess.STARTUPINFO(
-                        dwFlags=subprocess.STARTF_USESHOWWINDOW,
-                        wShowWindow=subprocess.SW_HIDE,
-                    )
-                    if os.name == "nt"
-                    else None
-                ),
-            )
-            self._update_status("FFmpeg found.", clear_after=5000)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            self._update_status(
-                "FFmpeg not found! Install & add to PATH.", is_error=True
-            )
-            messagebox.showerror(
-                "Error", "FFmpeg not found. Install FFmpeg & add to PATH."
-            )
-
-    def _create_widgets(self):
-        # Main container
-        main_frame = ttk.Frame(self.master, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Status bar at bottom
-        self.status_label = ttk.Label(
-            main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W
-        )
-        self.status_label.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0), ipady=2)
-
-        # Control frame (button, progress) above status bar
-        control_frame = ttk.Frame(main_frame, padding="5 0 5 0")  # Pad top/bottom
-        control_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
-
-        self.run_button = ttk.Button(
-            control_frame, text="Generate SRT", command=self._run_transcription
-        )
-        self.run_button.pack(side=tk.LEFT, padx=(0, 5))  # Adjust padding
-
-        self.progress_bar = ttk.Progressbar(
-            control_frame, variable=self.progress_var, maximum=100
-        )
-        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-
-        # Two-column layout frame (fills remaining space)
-        content_frame = ttk.Frame(main_frame)
-        content_frame.pack(fill=tk.BOTH, expand=True)
-        content_frame.columnconfigure(0, weight=1)  # Left col
-        content_frame.columnconfigure(1, weight=1)  # Right col
-        content_frame.rowconfigure(0, weight=1)  # Allow rows to expand if needed
-
-        # --- Left Column ---
-        left_column = ttk.Frame(content_frame, padding="5")
-        left_column.grid(
-            row=0, column=0, sticky="nsew", padx=(0, 5)
-        )  # Add padding between cols
-
-        # File Input (Left Col)
-        file_frame = ttk.LabelFrame(left_column, text="Input File", padding="10")
-        file_frame.pack(fill=tk.X, pady=5)
-        file_frame.columnconfigure(1, weight=1)  # Make entry expand
-
-        ttk.Label(file_frame, text="Video/Audio:").grid(
-            row=0, column=0, padx=5, pady=5, sticky=tk.W
-        )
-        ttk.Entry(file_frame, textvariable=self.file_path, width=40).grid(
-            row=0, column=1, padx=5, pady=5, sticky=tk.EW
-        )  # Adjust width
-        ttk.Button(file_frame, text="Browse...", command=self._select_file).grid(
-            row=0, column=2, padx=5, pady=5
-        )
-
-        # Model & Compute Settings (Left Col)
-        model_compute_frame = ttk.LabelFrame(
-            left_column, text="Model & Compute Settings", padding="10"
-        )
-        model_compute_frame.pack(fill=tk.X, pady=5)
-        model_compute_frame.columnconfigure(
-            1, weight=1
-        )  # Make controls expand where needed
-
-        ttk.Label(model_compute_frame, text="Model Size:").grid(
-            row=0, column=0, padx=5, pady=5, sticky=tk.W
-        )
-        model_combo = ttk.Combobox(
-            model_compute_frame,
-            textvariable=self.model_size,
-            values=[
-                "tiny",
-                "base",
-                "small",
-                "medium",
-                "large-v1",
-                "large-v2",
-                "large-v3",
-                "large-v3-turbo",
-            ],
-            state="readonly",
-            width=10,
-        )
-        model_combo.grid(row=0, column=1, padx=5, pady=5, sticky=tk.EW)
-
-        ttk.Label(model_compute_frame, text="Device:").grid(
-            row=0, column=2, padx=5, pady=5, sticky=tk.W
-        )
-        device_opts = ["cpu"]
-        if torch.cuda.is_available():
-            device_opts.insert(0, "cuda")  # Prioritize cuda
-        # Use variable directly, values will be updated if loaded
-        device_combo = ttk.Combobox(
-            model_compute_frame,
-            textvariable=self.device,
-            values=device_opts,
-            state="readonly",
-            width=7,
-        )
-        device_combo.grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
-        device_combo.bind("<<ComboboxSelected>>", self._update_compute_type_options)
-
-        ttk.Label(model_compute_frame, text="Compute Type:").grid(
-            row=1, column=0, padx=5, pady=5, sticky=tk.W
-        )
-        # Values populated by _update_compute_type_options
-        self.compute_type_combo = ttk.Combobox(
-            model_compute_frame,
-            textvariable=self.compute_type,
-            state="readonly",
-            width=10,
-        )
-        self.compute_type_combo.grid(row=1, column=1, padx=5, pady=5, sticky=tk.EW)
-        self._update_compute_type_options()  # Populate based on current (possibly loaded) device
-
-        ttk.Label(model_compute_frame, text="Batch Size:").grid(
-            row=1, column=2, padx=5, pady=5, sticky=tk.W
-        )
-        ttk.Spinbox(
-            model_compute_frame, from_=1, to=128, textvariable=self.batch_size, width=5
-        ).grid(row=1, column=3, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Label(model_compute_frame, text="Language:").grid(
-            row=2, column=0, padx=5, pady=5, sticky=tk.W
-        )
-        ttk.Entry(model_compute_frame, textvariable=self.language, width=10).grid(
-            row=2, column=1, padx=5, pady=5, sticky=tk.EW
-        )
-        ttk.Label(model_compute_frame, text="(blank=auto)").grid(
-            row=2, column=2, columnspan=2, padx=5, pady=5, sticky=tk.W
-        )
-
-        ttk.Label(model_compute_frame, text="HF Token:").grid(
-            row=3, column=0, padx=5, pady=5, sticky=tk.W
-        )
-        ttk.Entry(
-            model_compute_frame, textvariable=self.hf_token, show="*", width=10
-        ).grid(row=3, column=1, padx=5, pady=5, sticky=tk.EW)
-        ttk.Label(model_compute_frame, text="(opt, for diarize)").grid(
-            row=3, column=2, columnspan=2, padx=5, pady=5, sticky=tk.W
-        )  # Shorter text
-
-        # Processing Stages (Left Col)
-        process_frame = ttk.LabelFrame(
-            left_column, text="Processing Stages", padding="10"
-        )
-        process_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Checkbutton(
-            process_frame,
-            text="Align Transcription (better timing)",
-            variable=self.align_model_flag,
-        ).grid(row=0, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
-        ttk.Checkbutton(
-            process_frame,
-            text="Diarize Speakers (needs align & HF token)",
-            variable=self.diarize_flag,
-        ).grid(row=1, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
-
-        # VAD Options (Left Col)
-        vad_frame = ttk.LabelFrame(
-            left_column, text="VAD (Voice Activity Detection)", padding="10"
-        )
-        vad_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Label(vad_frame, text="VAD Thresh:").grid(
-            row=0, column=0, padx=5, pady=2, sticky=tk.W
-        )  # Shorter label
-        ttk.Entry(vad_frame, textvariable=self.vad_threshold_var, width=7).grid(
-            row=0, column=1, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Label(vad_frame, text="(0-1, lower=more sensitive)").grid(
-            row=0, column=2, columnspan=2, padx=5, pady=2, sticky=tk.W
-        )
-
-        ttk.Label(vad_frame, text="Min Speech (ms):").grid(
-            row=1, column=0, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Spinbox(
-            vad_frame,
-            from_=10,
-            to=10000,
-            increment=10,
-            textvariable=self.min_speech_dur_var,
-            width=5,
-        ).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(vad_frame, text="Min Silence (ms):").grid(
-            row=1, column=2, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Spinbox(
-            vad_frame,
-            from_=10,
-            to=10000,
-            increment=10,
-            textvariable=self.min_silence_dur_var,
-            width=5,
-        ).grid(row=1, column=3, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(vad_frame, text="Speech Pad (ms):").grid(
-            row=2, column=0, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Spinbox(
-            vad_frame,
-            from_=0,
-            to=5000,
-            increment=10,
-            textvariable=self.speech_pad_var,
-            width=5,
-        ).grid(row=2, column=1, padx=5, pady=2, sticky=tk.W)
-
-        # --- Right Column ---
-        right_column = ttk.Frame(content_frame, padding="5")
-        right_column.grid(
-            row=0, column=1, sticky="nsew", padx=(5, 0)
-        )  # Add padding between cols
-
-        # ASR Fine-tuning (Right Col)
-        asr_frame = ttk.LabelFrame(right_column, text="ASR Fine-tuning", padding="10")
-        asr_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Label(asr_frame, text="Beam Size:").grid(
-            row=0, column=0, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Spinbox(
-            asr_frame, from_=1, to=50, textvariable=self.beam_size_var, width=5
-        ).grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(asr_frame, text="Best Of:").grid(
-            row=0, column=2, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Spinbox(
-            asr_frame, from_=1, to=50, textvariable=self.best_of_var, width=5
-        ).grid(row=0, column=3, padx=5, pady=2, sticky=tk.W)
-
-        ttk.Label(asr_frame, text="Log Prob Thresh:").grid(
-            row=1, column=0, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Entry(asr_frame, textvariable=self.log_prob_thresh_var, width=7).grid(
-            row=1, column=1, padx=5, pady=2, sticky=tk.W
-        )
-
-        ttk.Label(asr_frame, text="No Speech Thresh:").grid(
-            row=1, column=2, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Entry(asr_frame, textvariable=self.no_speech_thresh_var, width=7).grid(
-            row=1, column=3, padx=5, pady=2, sticky=tk.W
-        )
-
-        ttk.Label(asr_frame, text="Length Penalty:").grid(
-            row=2, column=0, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Entry(asr_frame, textvariable=self.length_penalty_var, width=7).grid(
-            row=2, column=1, padx=5, pady=2, sticky=tk.W
-        )
-
-        ttk.Checkbutton(
-            asr_frame, text="Cond. on Prev Text", variable=self.condition_prev_text_var
-        ).grid(row=3, column=0, columnspan=2, padx=5, pady=2, sticky=tk.W)
-        ttk.Checkbutton(
-            asr_frame, text="Suppress Numerals", variable=self.suppress_numerals_var
-        ).grid(row=3, column=2, columnspan=2, padx=5, pady=2, sticky=tk.W)
-
-        # Diarization Options (Right Col)
-        diarize_frame = ttk.LabelFrame(
-            right_column, text="Diarization Options", padding="10"
-        )
-        diarize_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Label(diarize_frame, text="Min Speakers:").grid(
-            row=0, column=0, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Entry(diarize_frame, textvariable=self.min_speakers_var, width=7).grid(
-            row=0, column=1, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Label(diarize_frame, text="(blank=auto)").grid(
-            row=0, column=2, padx=5, pady=2, sticky=tk.W
-        )
-
-        ttk.Label(diarize_frame, text="Max Speakers:").grid(
-            row=1, column=0, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Entry(diarize_frame, textvariable=self.max_speakers_var, width=7).grid(
-            row=1, column=1, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Label(diarize_frame, text="(blank=auto)").grid(
-            row=1, column=2, padx=5, pady=2, sticky=tk.W
-        )
-
-        # SRT Formatting (Right Col)
-        srt_frame = ttk.LabelFrame(right_column, text="SRT Formatting", padding="10")
-        srt_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Label(srt_frame, text="Max Line Len:").grid(
-            row=0, column=0, padx=5, pady=5, sticky=tk.W
-        )  # Shorter label
-        ttk.Spinbox(
-            srt_frame, from_=10, to=200, textvariable=self.srt_max_len_var, width=5
-        ).grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
-
-        ttk.Label(srt_frame, text="Max Lines/Cap:").grid(
-            row=0, column=2, padx=5, pady=5, sticky=tk.W
-        )  # Shorter label
-        ttk.Spinbox(
-            srt_frame, from_=1, to=10, textvariable=self.srt_max_lines_var, width=5
-        ).grid(row=0, column=3, padx=5, pady=5, sticky=tk.W)
-
-    # --- Assume other methods like _select_file, _run_transcription, _update_status exist ---
-
-    def _update_compute_type_options(self, event=None):
-        # Update compute type based on device
-        selected_device = self.device.get()
-        if selected_device == 'cuda':
-            self.compute_type_combo['values'] = ['float16', 'int8_float16', 'int8']
-            if self.compute_type.get() not in self.compute_type_combo['values']:
-                self.compute_type.set('float16')
-        else: # cpu
-            self.compute_type_combo['values'] = ['int8', 'float32']
-            if self.compute_type.get() not in self.compute_type_combo['values']:
-                self.compute_type.set('int8')
-
-    def _select_file(self):
-        # Opens file dialog
-        filepath = filedialog.askopenfilename(
-            title="Select Media File",
-            filetypes=(("All Media Files", "*.*"),
-                       ("Video Files", "*.mp4 *.avi *.mkv *.mov *.wmv"),
-                       ("Audio Files", "*.mp3 *.wav *.ogg *.flac *.m4a"))
-        )
-        if filepath:
-            self.file_path.set(filepath)
-            self._update_status(f"Selected: {os.path.basename(filepath)}", clear_after=5000)
-
-    def _update_status(self, message, progress=None, is_error=False, clear_after=None):
-        # Updates status bar - now safe to call from `after` with positional args
-        self.status_var.set(message)
-        if is_error:
-            self.status_label.config(foreground="red")
-        else:
-            self.status_label.config(foreground="black") # Reset color on non-error
-
-        if progress is not None:
-            self.progress_var.set(progress)
-        self.master.update_idletasks() # Ensure UI updates immediately
-
-        if clear_after:
-            # Use lambda to capture current message for comparison
-            current_msg = message
-            self.master.after(clear_after, lambda: self.status_var.set("Ready") if self.status_var.get() == current_msg else None)
-
-    def _set_ui_state(self, state):
-        # Disables/enables gui
-        # Iterate safely over children, handling potential errors
-        for child in self.master.winfo_children():
-            self._recursive_set_state(child, state)
-
-        # Special handling for the Run button
-        if state == tk.DISABLED:
-            self.run_button.config(text="Running...", state=tk.DISABLED)
-        else:
-            # Check ffmpeg again before enabling run button fully
-            try:
-                subprocess.run(["ffmpeg", "-version"], check=True, capture_output=True, text=True)
-                self.run_button.config(text="Generate SRT", state=tk.NORMAL)
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                self.run_button.config(text="Generate SRT", state=tk.DISABLED) # Keep disabled if ffmpeg missing
-                self._update_status("FFmpeg not found! Cannot run.", is_error=True) # Keep error visible
-
-    def _recursive_set_state(self, widget, state):
-        # Helper for _set_ui_state
-        try:
-            # Check if the widget has a 'state' option
-            if 'state' in widget.configure():
-                widget.configure(state=state)
-
-            # Recurse into container widgets
-            for child in widget.winfo_children():
-                self._recursive_set_state(child, state)
-        except tk.TclError: # Ignore widgets without 'state' or already destroyed
-            pass
-        except AttributeError: # Ignore widgets without winfo_children (e.g., scrollbars)
-            pass
-
-    def _run_transcription(self):
-        # Starts process thread
-        input_file = self.file_path.get()
-        if not input_file or not os.path.exists(input_file):
-            messagebox.showerror("Error", "Please select a valid input file.")
-            return
-
-        # --- Merge GUI Options with Defaults ---
-        try:
-            # ASR
-            gui_asr_options = {
-                "beam_size": self.beam_size_var.get(),
-                "best_of": self.best_of_var.get(),
-                "log_prob_threshold": self.log_prob_thresh_var.get(),
-                "no_speech_threshold": self.no_speech_thresh_var.get(),
-                "condition_on_previous_text": self.condition_prev_text_var.get(),
-                "length_penalty": self.length_penalty_var.get(),
-                "suppress_numerals": self.suppress_numerals_var.get(),
-                "word_timestamps": True, # Always enable for align/diarize
-            }
-            self.asr_options = {**self._default_asr_options, **gui_asr_options}
-
-            # VAD
-            gui_vad_options = {
-                "vad_threshold": self.vad_threshold_var.get(),
-                "min_speech_duration_ms": self.min_speech_dur_var.get(),
-                "min_silence_duration_ms": self.min_silence_dur_var.get(),
-                "speech_pad_ms": self.speech_pad_var.get(),
-            }
-            self.vad_options = {**self._default_vad_options, **gui_vad_options}
-
-            # Align (not many options here)
-            self.align_config = {**self._default_align_config}
-
-            # Diarize
-            min_spk = self.min_speakers_var.get().strip() # Strip whitespace
-            max_spk = self.max_speakers_var.get().strip() # Strip whitespace
-            gui_diarize_options = {
-                 "min_speakers": int(min_spk) if min_spk.isdigit() else None,
-                 "max_speakers": int(max_spk) if max_spk.isdigit() else None,
-            }
-            self.diarize_options = {**self._default_diarize_options, **gui_diarize_options}
-
-            # SRT Formatting
-            gui_srt_options = {
-                "max_line_len": self.srt_max_len_var.get(),
-                "max_lines": self.srt_max_lines_var.get(),
-            }
-            self.srt_options = {**self._default_srt_options, **gui_srt_options}
-
-        except tk.TclError as e: # Catch errors getting values (e.g., invalid float)
-            messagebox.showerror("Invalid Option", f"Please check your numeric option values: {e}")
-            return
-        except ValueError as e: # Catch int conversion errors for speakers
-            messagebox.showerror("Invalid Option", f"Speaker counts must be numbers (or blank): {e}")
-            return
-
-        # --- Start Processing ---
-        self._set_ui_state(tk.DISABLED)
-        self._update_status("Starting...", 0)
-
-        self.processing_thread = threading.Thread(target=self._processing_task, args=(input_file,), daemon=True)
-        self.processing_thread.start()
-
-    def _load_models(self, load_diarization: bool):
-        """Load VAD, Whisper, and optionally Diarization models lazily."""
-        # Note: Alignment model loading is moved post-transcription if lang is auto-detect
-        current_progress = 20 # Starting progress after audio loading
-        specified_language = self.language.get() or None # Get lang if user specified
-
-        try:
-            # --- Load VAD Model (always needed for whisperx.load_model) ---
-            if self.vad_model is None:
-                self.master.after(0, self._update_status, "Loading VAD model...", current_progress)
-                self.vad_model = whisperx.vad.load_vad_model(self.device.get())
-                current_progress += 3
-                self.master.after(0, self._update_status, "VAD model loaded.", current_progress)
-
-            # --- Load Whisper Model ---
-            if self.whisper_model is None:
-                model_name = self.model_size.get()
-                self.master.after(0, self._update_status, f"Loading Whisper model: {model_name}...", current_progress)
-
-                effective_asr_options = {k: v for k, v in self.asr_options.items() if v is not None}
-                effective_vad_options = {k: v for k, v in self.vad_options.items() if v is not None}
-
-                self.whisper_model = whisperx.load_model(
-                    model_name,
-                    self.device.get(),
-                    compute_type=self.compute_type.get(),
-                    language=specified_language, # Pass specified lang (or None)
-                    asr_options=effective_asr_options,
-                    vad_options=effective_vad_options,
-                    vad_model=self.vad_model,
-                    task="transcribe",
-                )
-                current_progress += 10
-                self.master.after(0, self._update_status, "Whisper model loaded.", current_progress)
-
-            # --- Load Diarization Model (if needed) ---
-            if load_diarization and self.diarize_model is None:
-                token = self.hf_token.get()
-                if not token:
-                    # Don't raise error, just warn and skip
-                    self.master.after(0, self._update_status, "Warning: Diarization requires HF token. Skipping diarization model load.", current_progress, False, 5000) # is_error=False
-                    # No progress increase here
-                else:
-                    self.master.after(0, self._update_status, "Loading diarization model...", current_progress)
-                    try:
-                        self.diarize_model = whisperx.DiarizationPipeline(
-                            use_auth_token=token, device=self.device.get()
-                        )
-                        current_progress += 10 # Increase progress if successful
-                        self.master.after(0, self._update_status, "Diarization model loaded.", current_progress)
-                    except Exception as e:
-                        # Log error, warn user, skip diarization
-                        print(f"ERROR loading diarization model: {e}\n{traceback.format_exc()}")
-                        self.master.after(0, self._update_status, f"Error loading diarization model: {e}. Diarization skipped.", current_progress, True, 5000) # is_error=True
-                        self.diarize_model = None # Ensure it's None
-
-            return current_progress # Return progress after loading these models
-
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+
+            # Ensure all default keys exist
+            loaded_config = DEFAULT_CONFIG.copy()
+            loaded_config.update(config)  # Overwrite defaults with loaded
+
+            # Auto-adjust device/compute type if necessary
+            if loaded_config.get("device") == "cuda" and not torch.cuda.is_available():
+                loaded_config["device"] = "cpu"
+                loaded_config["compute_type"] = "int8"
+            elif loaded_config.get("device") == "cpu":
+                loaded_config["compute_type"] = "int8"
+
+            return loaded_config
+        except json.JSONDecodeError:
+            print(f"Warn: Config corrupted. Using defaults.")  # Explain: Config error
+            return DEFAULT_CONFIG.copy()
         except Exception as e:
-            # Propagate model loading errors (VAD/Whisper)
-            raise RuntimeError(f"Core model loading failed: {e}") from e
+            print(
+                f"Warn: Error loading config: {e}. Using defaults."
+            )  # Explain: Config error
+            return DEFAULT_CONFIG.copy()
+    else:
+        return DEFAULT_CONFIG.copy()
 
-    def _format_timestamp(self, seconds: float) -> str:
-        # Formats seconds to SRT time
-        assert seconds >= 0, "non-negative timestamp expected"
-        milliseconds = round(seconds * 1000.0)
-        hours = milliseconds // 3_600_000
-        milliseconds %= 3_600_000
-        minutes = milliseconds // 60_000
-        milliseconds %= 60_000
-        seconds = milliseconds // 1_000
-        milliseconds %= 1_000
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
-    def _generate_srt(self, result_segments) -> str:
-        # Generates srt string using runtime srt_options
-        srt_content = ""
-        count = 1
-        max_line_len = self.srt_options.get("max_line_len", 42)
-        max_lines = self.srt_options.get("max_lines", 2)
+def save_config(config: Dict[str, Any]):
+    """Saves config to file."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4)
+    except IOError as e:
+        print(f"Error saving config: {e}")  # Explain: Save fail
 
-        for segment in result_segments:
-            # Ensure start/end exist, skip segment if not (shouldn't happen with whisperx)
-            if 'start' not in segment or 'end' not in segment:
-                print(f"Warning: Skipping segment without start/end times: {segment.get('text', '')[:50]}...")
+
+def format_timestamp(seconds: float) -> str:
+    """Converts seconds to SRT timestamp format HH:MM:SS,ms."""
+    assert seconds >= 0, "non-negative timestamp expected"
+    milliseconds = round(seconds * 1000.0)
+
+    hours = milliseconds // 3_600_000
+    milliseconds %= 3_600_000
+
+    minutes = milliseconds // 60_000
+    milliseconds %= 60_000
+
+    seconds = milliseconds // 1_000
+    milliseconds %= 1_000
+
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+def split_text_into_blocks(text: str, max_chars: int, max_lines: int) -> List[str]:
+    """
+    Splits text into lines respecting max_chars,
+    then groups lines into blocks respecting max_lines.
+    """
+    words = text.split()
+    lines = []
+    current_line = ""
+
+    # Split into lines based on max_chars
+    for word in words:
+        if not current_line:
+            current_line = word
+        elif len(current_line) + len(word) + 1 <= max_chars:
+            current_line += " " + word
+        else:
+            lines.append(current_line)
+            current_line = word
+    if current_line:  # Append the last line
+        lines.append(current_line)
+
+    # Group lines into blocks based on max_lines
+    blocks = []
+    for i in range(0, len(lines), max_lines):
+        block = "\n".join(lines[i : i + max_lines])
+        blocks.append(block)
+
+    # Handle empty input case resulting in empty blocks
+    if not blocks and text.strip():
+        # If original text wasn't empty, but splitting made it so (e.g., only spaces)
+        # Or if splitting resulted in no lines somehow. Add empty block? Or handle upstream.
+        pass  # Let it return empty list if no content lines
+
+    return blocks
+
+
+def generate_srt_content(
+    result: Dict[str, Any],
+    speaker_names_map: Dict[str, str],
+    chars_per_line: int,
+    max_lines_per_entry: int,
+) -> str:
+    """Generates SRT content from whisperx result with speaker info."""
+    srt_content = []
+    entry_count = 1
+
+    # Check if segments exist in the result dictionary
+    if "segments" not in result or not isinstance(result["segments"], list):
+        print(
+            "Error: 'segments' key missing or not a list in result."
+        )  # Explain: Bad format
+        return "Error: Invalid result format for SRT generation."
+
+    for i, segment in enumerate(result["segments"]):
+        start_time = segment.get("start")
+        end_time = segment.get("end")
+        text = segment.get("text", "").strip()
+        # Get speaker assigned by assign_word_speakers
+        speaker = segment.get("speaker", "UNKNOWN")  # Explain: Use assigned
+
+        if start_time is None or end_time is None or not text:
+            print(
+                f"Skipping segment {i+1}: missing data (time or text)."
+            )  # Explain: Skip segment
+            continue
+
+        # Map speaker ID (e.g., SPEAKER_00) to the actual name
+        speaker_name = speaker_names_map.get(speaker, speaker)  # Use ID if no map
+
+        # Prepend speaker name to the text
+        formatted_text_with_speaker = f"{text}"  # Add speaker prefix
+
+        # Split the prefixed text into display blocks
+        text_blocks = split_text_into_blocks(
+            formatted_text_with_speaker, chars_per_line, max_lines_per_entry
+        )
+
+        # Create SRT entries for each block from the segment
+        for block in text_blocks:
+            if not block.strip():  # Skip empty blocks
                 continue
 
-            start_time_fmt = self._format_timestamp(segment['start'])
-            end_time_fmt = self._format_timestamp(segment['end'])
-            text = segment.get('text', '').strip()
-            speaker = f"Speaker {segment['speaker']}: " if 'speaker' in segment else ""
+            start_ts = format_timestamp(start_time)
+            end_ts = format_timestamp(end_time)
 
-            words = text.split()
-            lines = []
-            current_line = ""
-            for word in words:
-                test_line = f"{current_line} {word}".strip()
-                if len(test_line) <= max_line_len:
-                    current_line = test_line
-                else:
-                    if current_line: lines.append(current_line)
-                    # Handle words longer than max_line_len (split them)
-                    if len(word) > max_line_len:
-                        # Simple split, might break words mid-syllable
-                        lines.append(word[:max_line_len])
-                        current_line = word[max_line_len:]
-                    else:
-                        current_line = word
-            if current_line: lines.append(current_line)
+            # Add SRT entry: Index, Timestamp, Text Block
+            srt_entry = f"{entry_count}\n"
+            srt_entry += f"{start_ts} --> {end_ts}\n"
+            srt_entry += f"{block}\n"  # Add the text block
+            srt_content.append(srt_entry)
+            entry_count += 1  # Increment for each *block*
 
-            num_lines = len(lines)
-            for i in range(0, num_lines, max_lines):
-                chunk_lines = lines[i : i + max_lines]
-                if not chunk_lines: continue
+    return "\n".join(srt_content)
 
-                srt_content += f"{count}\n"
-                srt_content += f"{start_time_fmt} --> {end_time_fmt}\n"
-                # Add speaker prefix only to the first line of the chunk
-                srt_content += speaker + chunk_lines[0] + "\n"
-                for line in chunk_lines[1:]:
-                    srt_content += line + "\n"
-                srt_content += "\n" # Blank line
-                count += 1
-        return srt_content
 
-    def _processing_task(self, input_file):
-        # Main processing logic using merged options and lazy loading
-        temp_audio_file = None
-        current_progress = 0
-        result = None # Ensure result is defined for finally block cleanup checks
-        audio = None # Ensure audio is defined
+# --- GUI Class ---
+class WhisperXGUI:
+    def __init__(self, master: tk.Tk):
+        self.master = master
+        master.title("WhisperX SRT Generator")
+        master.geometry("750x650")  # Give it a bit more space
+
+        self.config = load_config()
+        self.processing_thread = None
+
+        # --- File Selection ---
+        self.file_frame = tk.Frame(master)
+        self.file_frame.pack(pady=5, padx=10, fill=tk.X)
+
+        tk.Label(self.file_frame, text="Audio File:").pack(side=tk.LEFT, padx=(0, 5))
+        self.file_path_var = tk.StringVar(value=self.config.get("audio_file_path", ""))
+        self.file_entry = tk.Entry(
+            self.file_frame, textvariable=self.file_path_var, width=60  # Wider entry
+        )
+        self.file_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+        self.browse_button = tk.Button(
+            self.file_frame, text="Browse...", command=self.select_file
+        )
+        self.browse_button.pack(side=tk.LEFT)
+
+        # --- Settings ---
+        self.settings_frame = tk.Frame(master)
+        self.settings_frame.pack(pady=10, padx=10, fill=tk.X)
+
+        # Configure grid weights for responsiveness
+        self.settings_frame.columnconfigure(1, weight=1)
+        self.settings_frame.columnconfigure(3, weight=1)
+
+        row_idx = 0
+        # Speaker Names
+        tk.Label(self.settings_frame, text="Speaker Names (comma-sep):").grid(
+            row=row_idx, column=0, sticky=tk.W, padx=5, pady=3
+        )
+        self.speaker_names_var = tk.StringVar(
+            value=self.config.get("speaker_names_str", "")
+        )
+        self.speaker_entry = tk.Entry(
+            self.settings_frame,
+            textvariable=self.speaker_names_var,  # Width auto managed by grid
+        )
+        self.speaker_entry.grid(
+            row=row_idx, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=3
+        )
+        row_idx += 1
+
+        # Formatting Controls (Chars/Line, Lines/Entry)
+        tk.Label(self.settings_frame, text="Max Chars/Line:").grid(
+            row=row_idx, column=0, sticky=tk.W, padx=5, pady=3
+        )
+        self.chars_var = tk.StringVar(value=self.config.get("chars_per_line", "42"))
+        self.chars_entry = tk.Entry(
+            self.settings_frame, textvariable=self.chars_var, width=10
+        )
+        self.chars_entry.grid(row=row_idx, column=1, sticky=tk.W, padx=5, pady=3)
+
+        tk.Label(self.settings_frame, text="Max Lines/Entry:").grid(
+            row=row_idx, column=2, sticky=tk.W, padx=5, pady=3
+        )
+        self.max_lines_var = tk.StringVar(
+            value=self.config.get("max_lines_per_entry", "2")
+        )
+        self.max_lines_entry = tk.Entry(
+            self.settings_frame, textvariable=self.max_lines_var, width=10
+        )
+        self.max_lines_entry.grid(row=row_idx, column=3, sticky=tk.W, padx=5, pady=3)
+        row_idx += 1
+
+        # Model Size
+        tk.Label(self.settings_frame, text="Model Size:").grid(
+            row=row_idx, column=0, sticky=tk.W, padx=5, pady=3
+        )
+        self.model_var = tk.StringVar(value=self.config.get("model_size", "base"))
+        self.model_entry = tk.Entry(
+            self.settings_frame, textvariable=self.model_var, width=15
+        )
+        # Consider adding options like: tiny, base, small, medium, large
+        self.model_entry.grid(row=row_idx, column=1, sticky=tk.W, padx=5, pady=3)
+        row_idx += 1
+
+        # Device and Compute Type (Readonly)
+        tk.Label(self.settings_frame, text="Device:").grid(
+            row=row_idx, column=0, sticky=tk.W, padx=5, pady=3
+        )
+        self.device_var = tk.StringVar(value=self.config.get("device", "cpu"))
+        self.device_entry = tk.Entry(
+            self.settings_frame,
+            textvariable=self.device_var,
+            width=10,
+            state="readonly",
+        )
+        self.device_entry.grid(row=row_idx, column=1, sticky=tk.W, padx=5, pady=3)
+
+        tk.Label(self.settings_frame, text="Compute Type:").grid(
+            row=row_idx, column=2, sticky=tk.W, padx=5, pady=3
+        )
+        self.compute_type_var = tk.StringVar(
+            value=self.config.get("compute_type", "int8")
+        )
+        self.compute_type_entry = tk.Entry(
+            self.settings_frame,
+            textvariable=self.compute_type_var,
+            width=10,
+            state="readonly",
+        )
+        self.compute_type_entry.grid(row=row_idx, column=3, sticky=tk.W, padx=5, pady=3)
+        row_idx += 1
+
+        # HF Token
+        tk.Label(self.settings_frame, text="HF Token (Optional):").grid(
+            row=row_idx, column=0, sticky=tk.W, padx=5, pady=3
+        )
+        self.hf_token_var = tk.StringVar(value=self.config.get("hf_token", ""))
+        self.hf_token_entry = tk.Entry(
+            self.settings_frame, textvariable=self.hf_token_var, show="*"
+        )
+        self.hf_token_entry.grid(
+            row=row_idx, column=1, columnspan=3, sticky=tk.EW, padx=5, pady=3
+        )
+        # row_idx += 1 # Not needed if last row
+
+        # --- Actions ---
+        self.action_frame = tk.Frame(master)
+        self.action_frame.pack(pady=15, padx=10, fill=tk.X)
+
+        self.generate_button = tk.Button(
+            self.action_frame,
+            text="Generate SRT",
+            command=self.start_processing,
+            width=20,
+            height=2,  # Larger button
+        )
+        self.generate_button.pack(pady=5)  # Center button
+
+        # --- Status Area ---
+        tk.Label(master, text="Status Log:").pack(pady=(5, 0), padx=10, anchor=tk.W)
+        self.status_text = scrolledtext.ScrolledText(
+            master,
+            height=12,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            relief=tk.SUNKEN,
+            borderwidth=1,
+        )
+        self.status_text.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
+
+        # --- Initial Status Update ---
+        self.update_status(
+            f"Config loaded. Device: {self.device_var.get()}, Compute: {self.compute_type_var.get()}"
+        )
+        if self.device_var.get() == "cuda":
+            self.update_status("CUDA detected and selected.")
+        else:
+            self.update_status("CUDA not detected or available. Using CPU.")
+
+    def update_status(self, message: str):
+        """Appends message to the status text area in a thread-safe way."""
+
+        def _update():
+            try:
+                self.status_text.config(state=tk.NORMAL)
+                self.status_text.insert(tk.END, message + "\n")
+                self.status_text.see(tk.END)  # Auto-scroll
+                self.status_text.config(state=tk.DISABLED)
+            except tk.TclError:
+                # Handle cases where the widget might be destroyed during shutdown
+                pass
+
+        # Ensure GUI updates happen on the main thread
+        if self.master.winfo_exists():
+            self.master.after(0, _update)
+
+    def select_file(self):
+        """Opens file dialog to select audio file."""
+        filepath = filedialog.askopenfilename(
+            title="Select Audio File",
+            filetypes=(
+                ("Audio Files", "*.mp3 *.wav *.m4a *.ogg *.flac"),
+                ("All Files", "*.*"),
+            ),
+        )
+        if filepath:
+            self.file_path_var.set(filepath)
+            self.update_status(
+                f"Selected audio file: {os.path.basename(filepath)}"
+            )  # Show only filename
+
+    def get_speaker_map(self) -> Dict[str, str]:
+        """Parses speaker names string into a map (SPEAKER_00 -> Name)."""
+        names_str = self.speaker_names_var.get().strip()
+        names = [name.strip() for name in names_str.split(",") if name.strip()]
+        # Map SPEAKER_00 -> name1, SPEAKER_01 -> name2 etc.
+        speaker_map = {f"SPEAKER_{i:02d}": name for i, name in enumerate(names)}
+        if not speaker_map:
+            self.update_status(
+                "Warning: No speaker names provided. Using default IDs."
+            )  # Explain: No names set
+        return speaker_map
+
+    def start_processing(self):
+        """Validates inputs and starts the WhisperX processing thread."""
+        # --- Input Validation ---
+        audio_file = self.file_path_var.get()
+        if not audio_file or not os.path.exists(audio_file):
+            messagebox.showerror("Error", "Valid audio file path required.")
+            return
+
+        model_size = self.model_var.get().strip()
+        if not model_size:
+            messagebox.showerror("Error", "Model size cannot be empty.")
+            return
 
         try:
-            output_basename = os.path.splitext(input_file)[0]
-            output_srt_file = f"{output_basename}.srt"
-            do_align = self.align_model_flag.get()
-            do_diarize = self.diarize_flag.get()
+            chars_per_line = int(self.chars_var.get().strip())
+            if chars_per_line <= 0:
+                raise ValueError("Must be positive")
+        except ValueError:
+            messagebox.showerror("Error", "Max Chars/Line must be a positive integer.")
+            return
 
-            # --- 1. Extract Audio (if needed) ---
-            self.master.after(0, self._update_status, "Extracting audio...", 5)
-            is_audio = input_file.lower().endswith(('.wav', '.mp3', '.flac', '.ogg', '.m4a'))
-            audio_path = input_file
-            if not is_audio:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
-                    temp_audio_file = tmpfile.name
-                audio_path = temp_audio_file
-                ffmpeg_command = ["ffmpeg", "-i", input_file, "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", "-y", audio_path]
-                try:
-                    subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0) # Hide console on windows
-                except subprocess.CalledProcessError as e:
-                    raise RuntimeError(f"FFmpeg Error: {e.stderr or e.stdout or 'Unknown'}") from e
-                except FileNotFoundError:
-                    raise RuntimeError("FFmpeg not found.") from None
+        try:
+            max_lines_per_entry = int(self.max_lines_var.get().strip())
+            if max_lines_per_entry <= 0:
+                raise ValueError("Must be positive")
+        except ValueError:
+            messagebox.showerror("Error", "Max Lines/Entry must be a positive integer.")
+            return
 
-            current_progress = 15
-            self.master.after(0, self._update_status, "Loading audio data...", current_progress)
-            audio = whisperx.load_audio(audio_path) # Load the audio file
+        speaker_names_str = self.speaker_names_var.get().strip()  # Can be empty
+        hf_token = self.hf_token_var.get().strip() or None  # Use None if empty
 
-            # --- 2. Load VAD, Whisper, and maybe Diarization Models ---
-            # Note: Alignment model is loaded later if needed & lang is auto
-            needs_diarize_model = do_diarize # Determine if diarization model load is attempted
-            current_progress = self._load_models(load_diarization=needs_diarize_model)
-            # self._load_models updates progress internally
+        # --- Update Config ---
+        self.config["audio_file_path"] = audio_file
+        self.config["speaker_names_str"] = speaker_names_str
+        self.config["chars_per_line"] = str(chars_per_line)
+        self.config["max_lines_per_entry"] = str(max_lines_per_entry)
+        self.config["model_size"] = model_size
+        self.config["hf_token"] = (
+            hf_token if hf_token else ""
+        )  # Store empty string in config
+        # Device/Compute Type are read-only, derived at load/runtime
 
-            # --- 3. Transcribe ---
-            self.master.after(0, self._update_status, "Transcribing audio...", current_progress)
+        save_config(self.config)
+
+        # --- Start Processing Thread ---
+        if self.processing_thread and self.processing_thread.is_alive():
+            messagebox.showwarning(
+                "Busy", "Processing is already in progress."
+            )  # Explain: Already running
+            return
+
+        self.generate_button.config(state=tk.DISABLED, text="Processing...")
+        self.status_text.config(state=tk.NORMAL)
+        self.status_text.delete("1.0", tk.END)  # Clear previous log
+        self.status_text.config(state=tk.DISABLED)
+        self.update_status(f"Starting processing for: {os.path.basename(audio_file)}")
+
+        self.processing_thread = threading.Thread(
+            target=self.run_whisperx_pipeline,
+            args=(
+                audio_file,
+                model_size,
+                chars_per_line,
+                max_lines_per_entry,
+                hf_token,
+            ),
+            daemon=True,  # Allow app exit even if thread runs
+        )
+        self.processing_thread.start()
+
+    def run_whisperx_pipeline(
+        self,
+        audio_file: str,
+        model_size: str,
+        chars_per_line: int,
+        max_lines_per_entry: int,
+        hf_token: str | None,
+    ):
+        """Runs the core WhisperX logic in a separate thread."""
+        model = None
+        model_a = None
+        diarize_model = None
+        audio = None
+        result = None  # Initialize result
+        try:
+            device = self.device_var.get()
+            compute_type = self.compute_type_var.get()
+            # Larger batch-size helps VRAM-rich GPUs, smaller helps low VRAM
+            batch_size = 16 if device == "cuda" else 4  # Smaller batch for CPU
+
+            # --- Load Audio ---
+            self.update_status("Loading audio...")
+            audio = whisperx.load_audio(audio_file)
+            self.update_status("Audio loaded successfully.")
+
+            # --- Load Transcription Model ---
+            self.update_status(
+                f"Loading model '{model_size}' on {device} [{compute_type}]..."
+            )
+            model = whisperx.load_model(model_size, device, compute_type=compute_type)
+            self.update_status("Transcription model loaded.")
+
+            # --- Transcribe ---
+            self.update_status("Starting transcription...")
+            result = model.transcribe(
+                audio, batch_size=batch_size
+            )  # Initial transcription
+            language_code = result.get("language", "unknown")
+            self.update_status(f"Transcription complete (Language: {language_code}).")
+
+            # --- Unload Transcription Model (Save VRAM/RAM) ---
+            del model
+            model = None  # Clear reference before GC
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            self.update_status("Transcription model unloaded.")
+
+            # --- Check Transcription Result ---
+            if not result or "segments" not in result or not result["segments"]:
+                raise ValueError("Transcription failed or produced no segments.")
+
+            # --- Alignment (Optional but improves timing) ---
+            # Skip alignment if language not supported or model load fails
             try:
-                # Use the loaded whisper_model and its internal asr/vad options
-                result = self.whisper_model.transcribe(
-                    audio,
-                    batch_size=self.batch_size.get() # Use GUI batch size
+                self.update_status(
+                    f"Loading alignment model for language: {language_code}..."
                 )
+                model_a, metadata = whisperx.load_align_model(
+                    language_code=language_code, device=device
+                )
+                self.update_status("Alignment model loaded. Aligning segments...")
+                # Align modifies 'result' in place or returns the modified structure
+                result = whisperx.align(
+                    result["segments"],
+                    model_a,
+                    metadata,
+                    audio,
+                    device,
+                    return_char_alignments=False,
+                )
+                self.update_status("Alignment complete.")
 
-            except Exception as e:
-                raise RuntimeError(f"Transcription failed: {e}") from e
+                # --- Unload Alignment Model ---
+                del model_a
+                model_a = None
+                del metadata
+                metadata = None
+                gc.collect()
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                self.update_status("Alignment model unloaded.")
 
-            # --- Determine Language Code for Alignment ---
-            # Use specified language, otherwise use detected language from result
-            language_code = self.language.get() or result.get("language")
-            if not language_code:
-                # If language still unknown, alignment cannot proceed
-                print("Warning: Language code unknown after transcription. Cannot perform alignment.")
-                do_align = False # Disable alignment if language is missing
-            else:
-                # Ensure language is set in GUI if auto-detected for clarity
-                if not self.language.get():
-                    self.master.after(0, self.language.set, language_code) # Update GUI var
-                    print(f"Detected language: {language_code}")
+            except Exception as align_error:
+                self.update_status(
+                    f"Warning: Alignment failed ({align_error}). Proceeding without alignment."
+                )  # Explain: Align fail warn
 
-            current_progress = 60 # Approx progress after transcription
-            self.master.after(0, self._update_status, "Transcription complete.", current_progress)
-
-            # --- 4. Load Alignment Model (if needed and lang known) ---
-            if do_align and self.align_model is None: # Only load if needed and not already loaded
-                self.master.after(0, self._update_status, f"Loading alignment model ({language_code})...", current_progress + 2)
-                try:
-                    self.align_model, self.align_metadata = whisperx.load_align_model(
-                        language_code=language_code, device=self.device.get()
+            # Ensure 'result' is a dict with 'segments' after potential alignment failure
+            if not isinstance(result, dict) or "segments" not in result:
+                # If alignment failed and didn't return the expected dict, reconstruct it.
+                # This assumes 'result' might have become just the list of segments.
+                if isinstance(result, list):
+                    result = {"segments": result, "language": language_code}  # Re-wrap
+                else:
+                    raise ValueError(
+                        "Result format is unexpected after alignment step."
                     )
-                    current_progress += 7
-                    self.master.after(0, self._update_status, "Alignment model loaded.", current_progress)
-                except Exception as e:
-                    # If specific lang model not found, align_model remains None
-                    print(f"Warning: Could not load alignment model for '{language_code}': {e}. Alignment will be skipped.")
-                    self.master.after(0, self._update_status, f"Warning: Alignment model for '{language_code}' not found. Skipping alignment.", current_progress, False, 5000)
-                    do_align = False # Disable alignment step
 
-            # --- 5. Align (if enabled and model loaded) ---
-            if do_align: # Re-check flag in case loading failed
-                if self.align_model and self.align_metadata:
-                    self.master.after(0, self._update_status, "Aligning transcription...", current_progress + 2)
-                    try:
-                        result = whisperx.align(result["segments"], self.align_model, self.align_metadata, audio, self.device.get(), return_char_alignments=self.align_config["return_char_alignments"])
-                        current_progress = 80 # Update progress after successful alignment
-                        self.master.after(0, self._update_status, "Alignment complete.", current_progress)
-                    except Exception as e:
-                        print(f"Warning: Alignment process failed: {e}. Using unaligned results.")
-                        self.master.after(0, self._update_status, f"Alignment failed: {e}. Using unaligned.", current_progress + 5)
-                        # Ensure 'result' still has 'segments' key, might just be list from transcribe
-                        if isinstance(result, dict) and 'segments' in result:
-                            pass # Already has segments structure
-                        elif isinstance(result, list):
-                            result = {'segments': result} # Wrap list in dict
-                        else:
-                            # This case should ideally not happen if transcribe worked
-                            raise RuntimeError("Alignment failed and transcription result format is unexpected.") from e
-                else:
-                    # This case should be covered by the loading step warning
-                    pass # Already warned if model didn't load
+            # --- Diarization ---
+            self.update_status("Loading diarization model...")
+            # Use token for gated models like pyannote/speaker-diarization
+            diarize_model = whisperx.DiarizationPipeline(
+                use_auth_token=hf_token, device=device
+            )
+            self.update_status("Performing speaker diarization...")
+            # You might need to adjust min_speakers/max_speakers if known
+            diarize_segments = diarize_model(audio)  # Pass audio tensor
+            self.update_status("Diarization complete.")
 
-            # --- 6. Diarize (if enabled and model loaded) ---
-            # Make sure alignment was intended OR transcription provides timestamps
-            # Diarization needs segments with 'start' and 'end'
-            can_diarize = do_diarize and self.diarize_model and isinstance(result, dict) and 'segments' in result and result['segments'] and all('start' in x and 'end' in x for x in result['segments'])
+            # --- Unload Diarization Model ---
+            del diarize_model
+            diarize_model = None
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            self.update_status("Diarization model unloaded.")
 
-            if do_diarize: # Check user intent first
-                if not do_align and not self.align_model_flag.get(): # Warn if user disabled align but wants diarize
-                    self.master.after(0, self._update_status, "Warning: Diarization works best with alignment enabled.", current_progress + 1, False, 5000)
+            # --- Assign Speakers ---
+            self.update_status("Assigning speakers to segments...")
+            # assign_word_speakers modifies segments within the 'result' dictionary
+            result = whisperx.assign_word_speakers(diarize_segments, result)
+            self.update_status("Speaker assignment complete.")
 
-                if not self.diarize_model:
-                    self.master.after(0, self._update_status, "Skipping diarization (model not loaded).", current_progress + 1)
-                elif not can_diarize:
-                    self.master.after(0, self._update_status, "Warning: Cannot diarize (segments missing or lack timestamps). Skipping.", current_progress + 1)
-                else:
-                    # Proceed with diarization
-                    self.master.after(0, self._update_status, "Performing diarization...", current_progress + 2)
-                    try:
-                        diarize_segments = self.diarize_model(audio, min_speakers=self.diarize_options['min_speakers'], max_speakers=self.diarize_options['max_speakers'])
-                        self.master.after(0, self._update_status, "Assigning speakers...", current_progress + 4)
+            # --- Generate SRT ---
+            self.update_status("Generating SRT file...")
+            speaker_map = self.get_speaker_map()
+            srt_output = generate_srt_content(
+                result, speaker_map, chars_per_line, max_lines_per_entry
+            )
 
-                        # Check if word timestamps are available for speaker assignment
-                        # WhisperX alignment output puts word timestamps inside 'segments' -> 'words'
-                        # Check if the 'words' key exists in the segments from the result dict
-                        has_word_timestamps = all('words' in seg for seg in result.get('segments', []))
+            # --- Save SRT ---
+            if "Error:" in srt_output:  # Check if SRT generation itself failed
+                raise ValueError(f"SRT generation failed: {srt_output}")
 
-                        if has_word_timestamps:
-                            result = whisperx.assign_word_speakers(diarize_segments, result)
-                            current_progress = 90 # Update progress
-                            self.master.after(0, self._update_status, "Diarization complete.", current_progress)
-                        else:
-                            # Fallback or warning if word timestamps aren't present
-                            print("Warning: Word-level timestamps not found in segments. Speaker assignment might be less accurate or skipped.")
-                            self.master.after(0, self._update_status, "Warning: Word timestamps missing. Skipping speaker assignment.", current_progress + 5, False, 5000)
-                            # Optionally, could try segment-level assignment if available in whisperx, but assign_word_speakers is standard
-
-                    except Exception as e:
-                        print(f"ERROR during diarization: {e}\n{traceback.format_exc()}")
-                        self.master.after(0, self._update_status, f"Diarization failed: {e}. Skipping speakers.", current_progress + 5, True)
-
-            # --- 7. Generate SRT ---
-            current_progress = 95 # Progress before final save
-            self.master.after(0, self._update_status, "Generating SRT file...", current_progress)
-            if not isinstance(result, dict) or 'segments' not in result or not result['segments']:
-                raise ValueError("No valid segments found in the result to generate SRT.")
-            srt_content = self._generate_srt(result["segments"])
-
-            # --- 8. Save SRT ---
-            with open(output_srt_file, 'w', encoding='utf-8') as f:
-                f.write(srt_content)
-            self.master.after(0, self._update_status, f"SRT saved: {output_srt_file}", 100)
-
-            # --- 9. Success ---
-            self.master.after(0, messagebox.showinfo, "Success", f"SRT file generated successfully:\n{output_srt_file}")
+            srt_filename = os.path.splitext(audio_file)[0] + ".srt"
+            with open(srt_filename, "w", encoding="utf-8") as f:
+                f.write(srt_output)
+            self.update_status(f"SRT file saved successfully: {srt_filename}")
+            self.master.after(
+                0,
+                messagebox.showinfo,
+                "Success",
+                f"SRT file generated:\n{srt_filename}",
+            )  # Use main thread dialog
 
         except Exception as e:
-            # --- Error Handling ---
-            error_message = f"Error: {str(e)}"
-            print(f"ERROR: {error_message}\n{traceback.format_exc()}") # Log full traceback
-            # Use positional args for `after` callback: message, progress, is_error, clear_after
-            self.master.after(0, self._update_status, error_message, None, True, None)
-            self.master.after(0, messagebox.showerror, "Error", error_message)
+            error_message = f"An error occurred during processing: {e}"
+            print(f"Error: {error_message}\nTraceback:")  # Log details
+            import traceback
 
+            traceback.print_exc()  # Print traceback to console
+            self.update_status(f"ERROR: {e}")  # Show simplified error in GUI
+            self.master.after(
+                0, messagebox.showerror, "Processing Error", error_message
+            )  # Use main thread dialog
         finally:
-            # --- Cleanup ---
-            self.master.after(0, self._update_status, "Cleaning up...", 99) # Indicate cleanup phase
-            # Unload models safely
-            models_to_del = {
-                'whisper': self.whisper_model,
-                'align': self.align_model,
-                'diarize': self.diarize_model,
-                'vad': self.vad_model
-            }
-            for name, model in models_to_del.items():
-                if model:
-                    print(f"Cleaning up {name} model...")
-                    try:
-                        del model
-                    except Exception as del_e:
-                        print(f"Note: Error during {name} model deletion: {del_e}")
+            # --- Final Cleanup ---
+            # Ensure button is re-enabled regardless of success/failure
+            self.master.after(0, self.reset_button)
+            # Release resources explicitly
+            del model, model_a, diarize_model, audio, result, diarize_segments
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.update_status("Processing finished. Resources released.")
 
-            # Reset placeholders
-            self.whisper_model = None
-            self.align_model = None
-            self.align_metadata = None
-            self.diarize_model = None
-            self.vad_model = None
-            result = None # Clear result reference
-            audio = None # Clear audio data reference
-
-            if self.device.get() == 'cuda':
-                try:
-                    print("Clearing CUDA cache...")
-                    torch.cuda.empty_cache()
-                except Exception as cache_e:
-                    print(f"Note: Error during CUDA cache clearing: {cache_e}")
-
-            # Delete temporary audio file
-            if temp_audio_file and os.path.exists(temp_audio_file):
-                try:
-                    print(f"Removing temporary audio file: {temp_audio_file}")
-                    os.remove(temp_audio_file)
-                except OSError as e:
-                    print(f"Warning: Could not delete temp file {temp_audio_file}: {e}")
-
-            # Re-enable UI
-            self.master.after(0, self._set_ui_state, tk.NORMAL)
-            # Reset status unless an error occurred and is still displayed
-            final_status = self.status_var.get()
-            is_error_displayed = self.status_label.cget("foreground") == "red"
-            if not is_error_displayed or "Success" in final_status: # Clear if success or non-error state
-                self.master.after(100, self._update_status, "Finished.", 0) # Reset progress and status
+    def reset_button(self):
+        """Resets the generate button state (called via master.after)."""
+        try:
+            if self.master.winfo_exists():
+                self.generate_button.config(state=tk.NORMAL, text="Generate SRT")
+        except tk.TclError:
+            pass  # Widget might be destroyed
 
 
+# --- Main Execution ---
 if __name__ == "__main__":
+    # Optional: Try importing and using a theme like sv_ttk
+    try:
+        import sv_ttk
+
+        USE_THEME = True
+    except ImportError:
+        sv_ttk = None
+        USE_THEME = False
+        print("sv_ttk not found, using default theme.")  # Explain: Theme missing
+
     root = tk.Tk()
-    app = WhisperXApp(root)
-    sv_ttk.set_theme("dark")
+    gui = WhisperXGUI(root)
+
+    if USE_THEME and sv_ttk:
+        sv_ttk.set_theme("dark")  # Or "light"
+
+    # Handle window close event gracefully
+    def on_closing():
+        if gui.processing_thread and gui.processing_thread.is_alive():
+            if messagebox.askokcancel("Quit", "Processing is ongoing. Quit anyway?"):
+                # Note: Force quitting might leave resources unclean.
+                # A more robust solution would involve signaling the thread to stop.
+                root.destroy()
+            else:
+                return  # Don't close if user cancels
+        else:
+            root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()

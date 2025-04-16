@@ -452,13 +452,6 @@ def cleanup():
         print(f"Error deleting temp folder: {e}")
 
 
-def handler():
-    file_paths = select_files()
-    for audio_path in file_paths:  # Iterating through data
-        if audio_path:
-            main(audio_path)
-
-
 def signal_handler(sig, frame):
     # Intercept termination signals
     cleanup()
@@ -501,6 +494,14 @@ def main(audio_path):
         except Exception as e:
             print(f"Error deleting temp folder: {e}")
     print("\nits\ndone\nnow\n")
+
+
+def handler():
+    file_paths = select_files()
+    for audio_path in file_paths:  # Iterating through data
+        if audio_path:
+            main(audio_path)
+
 
 if __name__ == "__main__":
     # Register signal handlers for Windows (CTRL+C) and termination
