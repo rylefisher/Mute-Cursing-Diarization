@@ -6,6 +6,7 @@ import numpy as np
 import scipy.io.wavfile as wavfile  # For dummy audio creation
 from _globals import *
 
+
 class WhisperXTranscriber:
     """Handles transcription, alignment, and diarization."""
     def __init__(
@@ -35,15 +36,15 @@ class WhisperXTranscriber:
 
         self._default_asr_options = {
             "log_prob_threshold": -3.0, # Accept low confidence words
-            "no_speech_threshold": 0.1, # Catch quieter speech
-            "temperatures": [0.0, 0.2, 0.4, 0.6, 0.8, 1.0], # Robustness
+            "no_speech_threshold": 0.05, # Catch quieter speech
+            "temperatures": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5], # Robustness
             "condition_on_previous_text": True, # Context for long audio
             "compression_ratio_threshold": None, # Disable filter
             "word_timestamps": True, # Needed for alignment
             "without_timestamps": False,
-            "beam_size": 5, # Balance accuracy/speed
-            "best_of": 5, # Balance accuracy/speed
-            "patience": None, # Faster decoding
+            "beam_size": 8, # Balance accuracy/speed
+            "best_of": 8, # Balance accuracy/speed
+            "patience": 2.0, # Faster decoding
             "length_penalty": 1.0,
             "repetition_penalty": 1.0,
             "no_repeat_ngram_size": 0,
@@ -62,12 +63,12 @@ class WhisperXTranscriber:
             "hotwords": None, # Could add curses if needed
         }
         self._default_vad_options = {
-            "vad_threshold": 0.15, # VAD sensitivity
-            "min_speech_duration_ms": 50, # Catch short speech
+            "vad_threshold": 0.08, # VAD sensitivity
+            "min_speech_duration_ms": 30, # Catch short speech
             "max_speech_duration_s": float("inf"),
-            "min_silence_duration_ms": 300, # Silence duration sensitivity
+            "min_silence_duration_ms": 100, # Silence duration sensitivity
             "window_size_samples": 1024,
-            "speech_pad_ms": 500, # Padding around speech
+            "speech_pad_ms": 700, # Padding around speech
         }
         self._default_transcribe_config = {
             "chunk_size": 25,
